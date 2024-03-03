@@ -2,7 +2,6 @@
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
-import numpy as np
 
 from app.pymupdf_parser.header_n_footer.text_similarity import text_similarity
 from app.pymupdf_parser.parameter.pymupdf_content import PyMuPdfContent, _Blocks, _Lines
@@ -18,7 +17,6 @@ def header_footer_preprocess(text: str):
 
 class HeaderNFooter:
     def __init__(self, mu_document: List[PyMuPdfContent]):
-
         self.mu_document = mu_document
         self.mu_document_lines: Dict[int, Dict[Tuple[int, int], _Lines]] = {}
         for page_no, mu_content in enumerate(mu_document):
@@ -62,7 +60,6 @@ class HeaderNFooter:
                     neighbour_page_no,
                     neighbour_page_key,
                 ) in neighboring_pages_lines_keys.items():
-
                     for second_key in neighbour_page_key:
                         line_2 = self.mu_document_lines[neighbour_page_no][second_key]
                         text_2 = "".join(span.text for span in line_2.spans).strip()

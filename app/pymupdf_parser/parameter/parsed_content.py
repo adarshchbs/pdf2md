@@ -1,6 +1,6 @@
 """Copyright (C) 2022 Adarsh Gupta"""
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, TypedDict, Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 from nptyping import Int, NDArray, Shape

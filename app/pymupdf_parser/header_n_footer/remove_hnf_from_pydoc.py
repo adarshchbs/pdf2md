@@ -1,5 +1,5 @@
 from app.pymupdf_parser.parameter.pymupdf_content import PyMuPdfContent
-from typing import List, Dict, DefaultDict, Tuple
+from typing import List, Dict, Tuple
 from collections import defaultdict
 from app.pymupdf_parser.data_type_for_content.convert_pymupdf import (
     convert_pymupdf_from_list_to_dict_type,

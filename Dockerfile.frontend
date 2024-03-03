@@ -1,0 +1,23 @@
+# Use an official Node.js runtime as a parent image
+FROM node:16
+
+# Set the working directory in the container
+WORKDIR /src
+
+# Copy the frontend source code and package.json
+COPY pdf-upload-app/ /src/pdf-upload-app
+COPY package.json /src/
+
+# Install serve for serving the frontend and dependencies
+RUN npm install -g serve && \
+    npm install --prefix /src && \
+    npm install --prefix /src/pdf-upload-app
+
+# RUN npm run build --prefix /src/pdf-upload-app
+
+# Make port 8080 available to the world outside this container
+EXPOSE 8080
+
+# Define the command to run the app
+# CMD ["serve", "-s", "/src/pdf-upload-app/dist", "-l", "8080"]
+CMD ["npm", "run", "serve", "--prefix",  "/src/pdf-upload-app/dist", "-l", "8080"]

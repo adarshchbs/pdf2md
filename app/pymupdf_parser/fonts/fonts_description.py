@@ -1,10 +1,9 @@
 """Copyright (C) 2022 Adarsh Gupta"""
-import json
 import re
 from typing import Dict, List, Tuple
 
 import community as community
-import Levenshtein
+from rapidfuzz.distance.Levenshtein import normalized_similarity
 import networkx as nx
 
 from app.pymupdf_parser.parameter.pymupdf_content import PyMuPdfContent
@@ -72,7 +71,7 @@ def partition_fonts_in_family(fonts) -> Dict[str, int]:
             font_2 = "".join(filter(str.isalnum, font_2))
             font_1 = p.sub("", font_1)
             font_2 = p.sub("", font_2)
-            differences = Levenshtein.ratio(font_1, font_2)  # type: ignore
+            differences = normalized_similarity(font_1, font_2)
             if differences < 0.6:
                 differences = 0
             G.add_edge(f1, f2, weight=differences)

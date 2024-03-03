@@ -5,10 +5,8 @@ from typing import Dict
 
 import numpy as np
 from rapidfuzz.distance.Levenshtein import distance as levenshtein
-from rapidfuzz.fuzz import ratio
 
-from app.pymupdf_parser.handle_list_indentifier.classify_numeral import \
-    numeral_dict
+from app.pymupdf_parser.handle_list_indentifier.classify_numeral import numeral_dict
 
 TEXT_SIMILARITY = "hard"  ## options: hard and soft
 

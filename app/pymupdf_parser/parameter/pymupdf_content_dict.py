@@ -1,6 +1,6 @@
 """Copyright (C) 2022 Adarsh Gupta"""
 from dataclasses import dataclass
-from typing import List, Tuple, OrderedDict
+from typing import Tuple, OrderedDict
 
 import numpy as np
 
