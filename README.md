@@ -20,16 +20,6 @@ Clone the github repo. Then run docker compose.
 
 The service will run on port 8080.
 
-## Usage Guidelines
-
-- Ensure your PDF documents are searchable. Non-searchable, image-based PDFs are not supported due to the lack of OCR capabilities in the current version of the service.
-- The contents inside tables will be omitted from the final output to maintain the consistency and readability of the Markdown format. Please consider this when preparing documents for conversion.
-- The output Markdown format is designed with structure in mind to facilitate subsequent processing by LLMs. However, it can also serve well for documentation, note-taking, and more.
-
-## Contributing
-
-Contributions to enhance the PDF to Markdown Conversion Service are more than welcome. Please feel free to fork the repository, make improvements, and submit pull requests. We're looking forward to your innovative ideas and contributions.
-
 
 ## Demo
 
@@ -45,4 +35,6 @@ Contributions to enhance the PDF to Markdown Conversion Service are more than we
 - Output the bounded table as Markdown table.
 - Support OCR
 
+## Contributing
 
+Contributions to enhance the PDF to Markdown Conversion are more than welcome. Please feel free to fork the repository, make improvements, and submit pull requests. We're looking forward to your innovative ideas and contributions.
