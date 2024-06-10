@@ -1,12 +1,12 @@
 from collections import OrderedDict
 import sys
 from os.path import dirname, realpath
+sys.path.append(dirname(dirname(dirname(dirname(realpath(__file__))))))
 
 from app.pymupdf_parser.table_parser.remove_recurring_horizontal_lines import (
     RecurringHorizontalLines,
 )
 
-sys.path.append(dirname(dirname(dirname(dirname(realpath(__file__))))))
 from typing import List, Dict, Tuple
 
 import fitz
@@ -33,7 +33,7 @@ from app.pymupdf_parser.table_parser.unbounded_table_detection import (
 from app.pymupdf_parser.utils.filter_item_inside_bbox import (
     filter_lines_which_are_inside_table,
 )
-
+from app.pymupdf_parser.table_parser.table_finder import find_table
 
 class TableDetection:
     def __init__(self, file_path: str):
@@ -48,95 +48,98 @@ class TableDetection:
     def propose(
         self,
     ):  # sourcery skip: inline-immediately-returned-variable, low-code-quality, use-named-expression
-        previous_image_width = np.nan
+        # previous_image_width = np.nan
         document_table: List[List[np.ndarray]] = []
-        horizontal_lines_per_page: Dict[int, OrderedDict[int, LineParameters]] = {}
-        page_width_height_dict: Dict[int, Tuple[float, float]] = {}
+        # horizontal_lines_per_page: Dict[int, OrderedDict[int, LineParameters]] = {}
+        # page_width_height_dict: Dict[int, Tuple[float, float]] = {}
         document_boxes: List[List[np.ndarray]] = []
         for page_no, (page, img) in enumerate(zip(self.doc, self.image_list)):
-            table_bboxes = []
-            boxes_bboxes = []
-            image_width = img.shape[1]
-            image_height = img.shape[0]
-            page_width_height_dict[page_no] = (image_width, image_width)
-            # TODO: change the acceptable_size to (min-span-width-in-the-page, 1.2* page-margin-width)
-            horizontal_lines_acceptable_size = (image_width / 30, 0.9 * image_width)
-            # TODO: change the acceptable_size to (min-span-height-in-the-page,  page-margin-height)
-            vertical_lines_acceptable_size = (image_height / 75, 0.9 * image_height)
+            img_table, img_boxes = find_table(img)
+            document_table.append(img_table)
+            document_boxes.append(img_boxes)
+            # table_bboxes = []
+            # boxes_bboxes = []
+            # image_width = img.shape[1]
+            # image_height = img.shape[0]
+            # page_width_height_dict[page_no] = (image_width, image_width)
+            # # TODO: change the acceptable_size to (min-span-width-in-the-page, 1.2* page-margin-width)
+            # horizontal_lines_acceptable_size = (image_width / 30, 0.9 * image_width)
+            # # TODO: change the acceptable_size to (min-span-height-in-the-page,  page-margin-height)
+            # vertical_lines_acceptable_size = (image_height / 75, 0.9 * image_height)
 
-            if previous_image_width != image_width:
-                ver_kernel, hor_kernel, kernel = cv_operations.get_morphological_kernel(
-                    img
-                )
-                previous_image_width = image_width
-            img, thresh = bounded_table.adaptive_threshold(img)
-            (
-                vertical_lines,
-                horizontal_lines,
-            ) = bounded_table.get_vertical_n_horizontal_lines(
-                vertical_lines_acceptable_size,
-                horizontal_lines_acceptable_size,
-                ver_kernel,  # type: ignore
-                hor_kernel,  # type: ignore
-                thresh,
-            )
-            if len(horizontal_lines) and len(vertical_lines):
+            # if previous_image_width != image_width:
+            #     ver_kernel, hor_kernel, kernel = cv_operations.get_morphological_kernel(
+            #         img
+            #     )
+            #     previous_image_width = image_width
+            # img, thresh = bounded_table.adaptive_threshold(img)
+            # (
+            #     vertical_lines,
+            #     horizontal_lines,
+            # ) = bounded_table.get_vertical_n_horizontal_lines(
+            #     vertical_lines_acceptable_size,
+            #     horizontal_lines_acceptable_size,
+            #     ver_kernel,  # type: ignore
+            #     hor_kernel,  # type: ignore
+            #     thresh,
+            # )
+            # if len(horizontal_lines) and len(vertical_lines):
 
-                horizontal_lines = cluster_lines.cluster_lines(
-                    np.array(
-                        [line.three_point_representation for line in horizontal_lines]
-                    ),
-                    LineType.horizontal,
-                )
+            #     horizontal_lines = cluster_lines.cluster_lines(
+            #         np.array(
+            #             [line.three_point_representation for line in horizontal_lines]
+            #         ),
+            #         LineType.horizontal,
+            #     )
 
-                vertical_lines = cluster_lines.cluster_lines(
-                    np.array(
-                        [line.three_point_representation for line in vertical_lines]
-                    ),
-                    LineType.vertical,
-                )
+            #     vertical_lines = cluster_lines.cluster_lines(
+            #         np.array(
+            #             [line.three_point_representation for line in vertical_lines]
+            #         ),
+            #         LineType.vertical,
+            #     )
 
-                "Draw the detected lines on a black canvas"
-                img_after_cluster = bounded_table.draw_vertical_n_horizontal_lines(
-                    img, vertical_lines, horizontal_lines
-                )
-                new_vertical_lines = (
-                    add_table_boundary.find_left_most_n_right_most_vertical_lines(
-                        img_after_cluster
-                    )
-                )
-                if new_vertical_lines:
-                    vertical_lines.extend(new_vertical_lines)
-                    img_after_cluster = bounded_table.draw_vertical_n_horizontal_lines(
-                        img, vertical_lines, horizontal_lines
-                    )
+            #     "Draw the detected lines on a black canvas"
+            #     img_after_cluster = bounded_table.draw_vertical_n_horizontal_lines(
+            #         img, vertical_lines, horizontal_lines
+            #     )
+            #     new_vertical_lines = (
+            #         add_table_boundary.find_left_most_n_right_most_vertical_lines(
+            #             img_after_cluster
+            #         )
+            #     )
+            #     if new_vertical_lines:
+            #         vertical_lines.extend(new_vertical_lines)
+            #         img_after_cluster = bounded_table.draw_vertical_n_horizontal_lines(
+            #             img, vertical_lines, horizontal_lines
+            #         )
 
-                tables, boxes = bounded_table.detect_cell_of_table(
-                    vertical_lines,
-                    horizontal_lines,
-                    img_after_cluster,  # type: ignore
-                    vertical_lines_acceptable_size,
-                    horizontal_lines_acceptable_size,
-                )
-                table_bboxes.extend([table.bbox for table in tables])
-                boxes_bboxes.extend([box.bbox for box in boxes])
-                # for table in tables:
-                #     page.add_highlight_annot(table.bbox)
-                horizontal_lines = filter_lines_which_are_inside_table(
-                    horizontal_lines,
-                    [table.bbox for table in tables] + [box.bbox for box in boxes],
-                )
+            #     tables, boxes = bounded_table.detect_cell_of_table(
+            #         vertical_lines,
+            #         horizontal_lines,
+            #         img_after_cluster,  # type: ignore
+            #         vertical_lines_acceptable_size,
+            #         horizontal_lines_acceptable_size,
+            #     )
+            #     table_bboxes.extend([table.bbox for table in tables])
+            #     boxes_bboxes.extend([box.bbox for box in boxes])
+            #     # for table in tables:
+            #     #     page.add_highlight_annot(table.bbox)
+            #     horizontal_lines = filter_lines_which_are_inside_table(
+            #         horizontal_lines,
+            #         [table.bbox for table in tables] + [box.bbox for box in boxes],
+            #     )
 
-            if len(horizontal_lines):
-                horizontal_lines_per_page[page_no] = OrderedDict()
-                for line_no, line in enumerate(horizontal_lines):
-                    horizontal_lines_per_page[page_no][line_no] = line
+            # if len(horizontal_lines):
+            #     horizontal_lines_per_page[page_no] = OrderedDict()
+            #     for line_no, line in enumerate(horizontal_lines):
+            #         horizontal_lines_per_page[page_no][line_no] = line
 
-                # for bbox in unbounded_tables_bbox:
-                #     page.add_highlight_annot(bbox)
+            #     # for bbox in unbounded_tables_bbox:
+            #     #     page.add_highlight_annot(bbox)
 
-            document_table.append(table_bboxes)
-            document_boxes.append(boxes_bboxes)
+            # document_table.append(table_bboxes)
+            # document_boxes.append(boxes_bboxes)
         # rhl = RecurringHorizontalLines(
         #     horizontal_lines_per_page, page_width_height_dict
         # )
