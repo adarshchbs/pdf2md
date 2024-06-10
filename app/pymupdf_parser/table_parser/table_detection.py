@@ -33,7 +33,7 @@ from app.pymupdf_parser.table_parser.unbounded_table_detection import (
 from app.pymupdf_parser.utils.filter_item_inside_bbox import (
     filter_lines_which_are_inside_table,
 )
-from app.pymupdf_parser.table_parser.table_finder import tableFinder
+from app.pymupdf_parser.table_parser.table_finder import find_table
 
 class TableDetection:
     def __init__(self, file_path: str):
@@ -54,7 +54,7 @@ class TableDetection:
         # page_width_height_dict: Dict[int, Tuple[float, float]] = {}
         document_boxes: List[List[np.ndarray]] = []
         for page_no, (page, img) in enumerate(zip(self.doc, self.image_list)):
-            img_table, img_boxes = tableFinder(img)
+            img_table, img_boxes = find_table(img)
             document_table.append(img_table)
             document_boxes.append(img_boxes)
             # table_bboxes = []

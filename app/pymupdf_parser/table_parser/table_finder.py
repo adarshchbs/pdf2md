@@ -21,7 +21,7 @@ from app.pymupdf_parser.utils.filter_item_inside_bbox import (
     filter_lines_which_are_inside_table,
 )
 
-def tableFinder(
+def find_table(
     img
 ):
     table_bboxes = []
