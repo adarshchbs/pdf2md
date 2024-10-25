@@ -27,6 +27,13 @@ class HeaderNFooter:
             self.mu_document_lines[page_no] = mu_content_lines
 
     def propose(self):
+        """
+        Proposes header and footer lines for each page based on
+        the y-coordinate of the origin of the first span of the blocks.
+
+        Returns:
+            None
+        """
         self.header_proposal: Dict[int, List[Tuple[int, int]]] = {}
         self.footer_proposal: Dict[int, List[Tuple[int, int]]] = {}
         for page_no, mu_content_lines in self.mu_document_lines.items():
@@ -39,6 +46,17 @@ class HeaderNFooter:
             self.footer_proposal[page_no] = sorted_content[-4:][::-1]
 
     def critise(self, header_or_footer_list: Dict[int, List[Tuple[int, int]]]):
+        """
+        Critises the header or footer lines based on their similarity and overlap with neighboring lines.
+
+
+        Args:
+            header_or_footer_list (Dict[int, List[Tuple[int, int]]]): A dictionary containing the page number as key and a list of line keys as value.
+
+        Returns:
+            Dict[int, List[Tuple[int, int]]]: A dictionary containing the page number as key and a list of line keys that are considered as header or footer.
+        """
+
         score: Dict[int, Dict[Tuple[int, int], float]] = defaultdict(dict)
 
         for page_no, line_keys in header_or_footer_list.items():

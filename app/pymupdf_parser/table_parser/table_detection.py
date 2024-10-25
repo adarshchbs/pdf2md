@@ -81,7 +81,6 @@ class TableDetection:
                 thresh,
             )
             if len(horizontal_lines) and len(vertical_lines):
-
                 horizontal_lines = cluster_lines.cluster_lines(
                     np.array(
                         [line.three_point_representation for line in horizontal_lines]
@@ -149,8 +148,8 @@ class TableDetection:
         #     )
         #     table_bboxes = document_table[page_no]
         #     table_bboxes.extend(unbounded_tables_bbox)
-            # for bbox in unbounded_tables_bbox:
-            #     self.doc[page_no].add_highlight_annot(bbox)
+        # for bbox in unbounded_tables_bbox:
+        #     self.doc[page_no].add_highlight_annot(bbox)
         # for page_no, boxes_bboxes in enumerate(document_boxes):
         #     for bbox in boxes_bboxes:
         #         self.doc[page_no].add_highlight_annot(bbox)

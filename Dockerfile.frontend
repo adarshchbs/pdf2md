@@ -21,4 +21,4 @@ EXPOSE 8080
 
 # Define the command to run the app
 CMD ["serve", "-s", "dist/", "-l","8080"]
-# CMD ["npm", "run", "serve"]
+# CMD ["npm", "run", "serve"]c

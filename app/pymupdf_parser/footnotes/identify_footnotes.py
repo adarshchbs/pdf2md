@@ -5,6 +5,16 @@ import re
 
 
 def get_block_no_for_page_desc_order(parsed_doc: List[Block]):
+    """
+    Returns the block numbers for each page in descending order of the block's bottom coordinate.
+
+    Args:
+        parsed_doc (List[Block]): The parsed document containing blocks.
+
+    Yields:
+        List[Tuple[int, Block]]: A list of tuples containing the block number and the corresponding block,
+        sorted in descending order of the block's bottom coordinate.
+    """
     parsed_doc_with_page: DefaultDict[
         Union[int, float], List[Tuple[int, Block]]
     ] = defaultdict(list)
@@ -23,6 +33,16 @@ def get_block_no_for_page_desc_order(parsed_doc: List[Block]):
 def is_upper_and_smaller_than_next_span_text(
     span_first: Span, span_second: Span
 ) -> bool:
+    """
+    Checks if the second span is positioned higher and smaller than the first span.
+
+    Args:
+        span_first (Span): The first span.
+        span_second (Span): The second span.
+
+    Returns:
+        bool: True if the second span is positioned higher or smaller than the first span, False otherwise.
+    """
     is_upper = (span_second.start_span_bbox[3] - span_first.end_span_bbox[3]) > 0.05 * (
         span_second.start_span_bbox[3] - span_second.start_span_bbox[1]
     )
@@ -31,6 +51,18 @@ def is_upper_and_smaller_than_next_span_text(
 
 
 def is_block_footnote(block: Block):
+    r"""
+    \A asserts the start of a string.
+    (\w\d|\d\w|\d{1,3}|\w) is a group that matches one of the following:
+        \w\d matches a word character (equal to [a-zA-Z0-9_]) followed by a digit (equal to [0-9]).
+        \d\w matches a digit followed by a word character.
+        \d{1,3} matches a digit repeated 1 to 3 times.
+        \w matches a word character.
+    \Z asserts the end of a string.
+
+    So, this regex pattern will match a string that starts and ends with
+    either a word character followed by a digit, a digit followed by a word
+    character, up to three digits, or a single word character."""
     if len(block.spans) == 1:
         return False
 
