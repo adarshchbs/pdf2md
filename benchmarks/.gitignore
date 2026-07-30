@@ -1,0 +1,19 @@
+# Benchmark-local generated and downloaded material
+generated/
+downloads/
+raw/
+runs/
+cache/
+work/
+models/
+containers/
+
+# Result artifacts are generated; retain only the directory placeholder.
+results/*
+!results/.gitkeep
+
+# Common local outputs if placed below benchmarks.
+*.pdf
+*.log
+*.tmp
+*.partial
