@@ -1,6 +1,7 @@
 # Benchmark-local generated and downloaded material
 generated/
 downloads/
+datasets/
 raw/
 runs/
 cache/
@@ -11,6 +12,8 @@ containers/
 # Result artifacts are generated; retain only the directory placeholder.
 results/*
 !results/.gitkeep
+!results/parsebench-2026-07-31.md
+!results/parsebench-2026-07-31.json
 
 # Common local outputs if placed below benchmarks.
 *.pdf

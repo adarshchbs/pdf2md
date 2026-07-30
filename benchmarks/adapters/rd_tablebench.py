@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from benchmarks.canonical import CanonicalPage, validate_page_collection
+import html
+
+from benchmarks.canonical import CanonicalPage, CanonicalTable, validate_page_collection
 
 
 class UnsupportedTableRepresentationError(ValueError):
@@ -38,6 +40,31 @@ def export_rd_tablebench(pages: list[CanonicalPage]) -> list[dict[str, object]]:
                 "html": table.html,
             })
     return records
+
+
+def render_rd_tablebench_html(table: CanonicalTable) -> str:
+    """Render the parser's canonical cell grid as strict evaluator HTML.
+
+    This is an evaluation-only format projection. It preserves canonical cell text and
+    spans without consulting the benchmark reference or altering parser structure.
+    """
+    anchors = {(cell.row_index, cell.column_index): cell for cell in table.cells}
+    rows: list[str] = []
+    for row_index in range(table.row_count):
+        cells: list[str] = []
+        for column_index in range(table.column_count):
+            cell = anchors.get((row_index, column_index))
+            if cell is None:
+                continue
+            tag = "th" if row_index == 0 else "td"
+            attributes = ""
+            if cell.rowspan > 1:
+                attributes += f' rowspan="{cell.rowspan}"'
+            if cell.colspan > 1:
+                attributes += f' colspan="{cell.colspan}"'
+            cells.append(f"<{tag}{attributes}>{html.escape(cell.text)}</{tag}>")
+        rows.append(f"<tr>{''.join(cells)}</tr>")
+    return f"<table>{''.join(rows)}</table>"
 
 
 def _table_id(document_id: str, table_id: str) -> str:

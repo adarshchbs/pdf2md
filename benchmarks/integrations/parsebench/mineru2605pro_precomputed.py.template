@@ -1,0 +1,73 @@
+"""Pinned ParseBench provider for reference-free, precomputed MinerU 2.5 Pro output."""
+
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from parse_bench.inference.providers.base import Provider, ProviderPermanentError
+from parse_bench.inference.providers.parse.mineru2605pro import MinerU2605ProProvider
+from parse_bench.inference.providers.registry import register_provider
+from parse_bench.schemas.pipeline import PipelineSpec
+from parse_bench.schemas.pipeline_io import InferenceRequest, RawInferenceResult
+from parse_bench.schemas.product import ProductType
+
+
+@register_provider("mineru2605pro_precomputed")
+class MinerU2605ProPrecomputedProvider(MinerU2605ProProvider):
+    """Load outputs produced locally by the pinned MinerU MLX CLI.
+
+    The provider receives only the source path and immutable precomputed parser output.
+    ParseBench references and expected answers are never exposed to MinerU.
+    """
+
+    def __init__(self, provider_name: str, base_config: dict[str, Any] | None = None):
+        Provider.__init__(self, provider_name, base_config)
+        output_dir = os.getenv("MINERU_PRECOMPUTED_DIR")
+        if not output_dir:
+            raise ProviderPermanentError("MINERU_PRECOMPUTED_DIR is required")
+        self._output_dir = Path(output_dir)
+
+    def run_inference(self, pipeline: PipelineSpec, request: InferenceRequest) -> RawInferenceResult:
+        if request.product_type != ProductType.PARSE:
+            raise ProviderPermanentError("mineru2605pro_precomputed only supports PARSE")
+        source_path = Path(request.source_file_path)
+        if source_path.suffix.lower() != ".pdf" or not source_path.is_file():
+            raise ProviderPermanentError(f"PDF file not found: {source_path}")
+
+        output_name = f"{source_path.parent.name}__{source_path.stem}"
+        result_dir = self._output_dir / output_name / "vlm"
+        markdown_path = result_dir / f"{output_name}.md"
+        model_path = result_dir / f"{output_name}_model.json"
+        if not markdown_path.is_file() or not model_path.is_file():
+            raise ProviderPermanentError(f"precomputed MinerU output missing for {source_path}")
+
+        blocks_by_page = json.loads(model_path.read_text(encoding="utf-8"))
+        if not isinstance(blocks_by_page, list) or len(blocks_by_page) != 1:
+            raise ProviderPermanentError(f"expected one MinerU output page for {source_path}")
+        blocks = blocks_by_page[0]
+        if not isinstance(blocks, list):
+            raise ProviderPermanentError(f"invalid MinerU model output for {source_path}")
+
+        now = datetime.now()
+        return RawInferenceResult(
+            request=request,
+            pipeline=pipeline,
+            pipeline_name=pipeline.pipeline_name,
+            product_type=request.product_type,
+            raw_output={
+                "markdown": markdown_path.read_text(encoding="utf-8"),
+                "blocks": blocks,
+                "image_width": 1000,
+                "image_height": 1000,
+                "_config": {
+                    "backend": "vlm-engine",
+                    "engine": "mlx",
+                    "server_url": "local://mineru25-precomputed",
+                },
+            },
+            started_at=now,
+            completed_at=now,
+            latency_in_ms=0,
+        )

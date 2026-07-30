@@ -1,0 +1,182 @@
+{
+  "result_label": "NOT_COMPARABLE",
+  "generated_on": "2026-07-31",
+  "comparability_reasons": [
+    "candidate concurrency and resource envelopes differed",
+    "the environment was not isolated from other local workloads",
+    "the parser ran from a mutable dirty working tree",
+    "the full and small dataset snapshots are separate harnesses"
+  ],
+  "evaluator": {
+    "name": "ParseBench",
+    "version": "0.2.0",
+    "revision": "1d460294b3b9c57fb3fa944dc17a9c044c24d1e5"
+  },
+  "dataset": {
+    "repository": "llamaindex/ParseBench",
+    "full_revision": "2805a1d940f95a203e0ae4b88be9934f7765b3fc",
+    "test_revision": "68bbab242f749df2e2ef753daabcbbbe291d943e"
+  },
+  "environment": {
+    "repository_head_observed_after_run": "c5709ab32b6c826a2f45641cbdcfa3db19c12b74",
+    "pdf2md_source_glob": "app/pdf2md/*.py",
+    "pdf2md_source_file_count": 28,
+    "pdf2md_source_bundle_sha256_observed_after_run": "cc7b203f324a60542573781cb94c6bf4bc6c61998b99f86debb1d000ade51eeb",
+    "uv_lock_sha256_observed_after_run": "178aff8f34037f55b782fe81a15b85657f2996244adf77752910e35d51d89290",
+    "python": "3.13.13",
+    "platform": "macOS-arm64",
+    "packages": {
+      "pdf2md": "0.1.0",
+      "pymupdf": "1.28.0",
+      "pypdf": "6.14.2",
+      "parse-bench": "0.2.0"
+    },
+    "capture_limitation": "Concurrent repository work was present; post-run hashes do not prove files remained unchanged throughout inference."
+  },
+  "paid_api_cost_usd": {
+    "anthropic": 0.0,
+    "gemini": 0.0
+  },
+  "full": {
+    "source_requests": 2078,
+    "evidence_paths": {
+      "pdf2md_local": "benchmarks/runs/parsebench-full/pdf2md_local/pdf2md_local",
+      "pymupdf_text": "benchmarks/runs/parsebench-full/pymupdf_text/pymupdf_text",
+      "pypdf_baseline": "benchmarks/runs/parsebench-full/pypdf_baseline/pypdf_baseline"
+    },
+    "candidates": {
+      "pdf2md_local": {
+        "capabilities": {"tables": true, "charts": true, "layout": true},
+        "inference": {"successful": 2003, "failed": 75, "skipped": 0, "avg_latency_ms": 2707.8},
+        "evaluation": {"successful": 2020, "failed": 50, "skipped": 8},
+        "scores": {
+          "content_faithfulness": 0.4358674568076703,
+          "semantic_formatting": 0.007636119815606995,
+          "grits_content": 0.07455673211491429,
+          "grits_trm_composite": 0.05144609782659715,
+          "chart_data_point_pass_rate": 0.012045384496840807,
+          "layout_element_rule_pass_rate": 0.016272934115361414,
+          "layout_localization_pass_rate": 0.46191814794218844,
+          "layout_classification_pass_rate": 0.36383183714155415,
+          "layout_attribution_pass_rate": 0.0,
+          "layout_map_50_95": 0.1363375648124955,
+          "normalized_order": 0.3990176589139613,
+          "normalized_text_correctness": 0.20595601624588714,
+          "micro_rule_pass_rate": 0.24218338868020398
+        }
+      },
+      "pymupdf_text": {
+        "capabilities": {"tables": false, "charts": false, "layout": false},
+        "inference": {"successful": 2036, "failed": 42, "skipped": 0, "avg_latency_ms": 8.86},
+        "evaluation": {"successful": 1642, "failed": 436, "skipped": 0},
+        "scores": {
+          "content_faithfulness": 0.13363964609476472,
+          "semantic_formatting": 0.004869052601415423,
+          "grits_trm_composite": null,
+          "chart_data_point_pass_rate": null,
+          "layout_element_rule_pass_rate": null,
+          "layout_map_50_95": null,
+          "micro_rule_pass_rate": 0.1972137314836586
+        }
+      },
+      "pypdf_baseline": {
+        "capabilities": {"tables": false, "charts": false, "layout": false},
+        "inference": {"successful": 2011, "failed": 67, "skipped": 0, "avg_latency_ms": 66.8},
+        "evaluation": {"successful": 1642, "failed": 436, "skipped": 0},
+        "scores": {
+          "content_faithfulness": 0.1318714240372155,
+          "semantic_formatting": 0.004682415796637521,
+          "grits_trm_composite": null,
+          "chart_data_point_pass_rate": null,
+          "layout_element_rule_pass_rate": null,
+          "layout_map_50_95": null,
+          "micro_rule_pass_rate": 0.18528097813308253
+        },
+        "upstream_summary_total": 2053,
+        "accounting_note": "successful + failed equals 2078 despite upstream total=2053"
+      }
+    }
+  },
+  "test_snapshot": {
+    "source_requests": 12,
+    "evidence_paths": {
+      "pdf2md_local": "benchmarks/runs/parsebench-test/pdf2md_local/pdf2md_local",
+      "pymupdf_text": "benchmarks/runs/parsebench-test/pymupdf_text/pymupdf_text",
+      "pypdf_baseline": "benchmarks/runs/parsebench-test/pypdf_baseline/pypdf_baseline",
+      "docling_local": "benchmarks/runs/parsebench-test/docling_local/docling_local",
+      "mineru2605pro_local_mlx": "benchmarks/runs/parsebench-test/mineru_vlm/parsebench-v2/mineru2605pro_precomputed"
+    },
+    "candidates": {
+      "pdf2md_local": {
+        "inference": {"successful": 12, "failed": 0, "avg_latency_ms": 841.0},
+        "evaluation": {"successful": 12, "failed": 0, "skipped": 0},
+        "scores": {"normalized_text_score": 0.0, "semantic_formatting": 0.0, "grits_trm_composite": 0.013153262717256748, "chart_data_point_pass_rate": 0.0, "layout_element_rule_pass_rate": 0.011494252873563218, "layout_attribution_pass_rate": 0.0, "layout_map_50_95": 0.143278830670135}
+      },
+      "pymupdf_text": {
+        "inference": {"successful": 12, "failed": 0, "avg_latency_ms": 12.75},
+        "evaluation": {"successful": 9, "failed": 3, "skipped": 0},
+        "scores": {"normalized_text_score": 0.0, "semantic_formatting": 0.0, "grits_trm_composite": null, "chart_data_point_pass_rate": null, "layout_element_rule_pass_rate": null, "layout_attribution_pass_rate": null, "layout_map_50_95": null}
+      },
+      "pypdf_baseline": {
+        "inference": {"successful": 12, "failed": 0, "avg_latency_ms": 49.25},
+        "evaluation": {"successful": 9, "failed": 3, "skipped": 0},
+        "scores": {"normalized_text_score": 0.0, "semantic_formatting": 0.0, "grits_trm_composite": null, "chart_data_point_pass_rate": null, "layout_element_rule_pass_rate": null, "layout_attribution_pass_rate": null, "layout_map_50_95": null}
+      },
+      "docling_local": {
+        "code_revision": "f2683c0b5aa14a53b74373b0640260891cdbc1b0",
+        "packages": {"docling-slim": "2.117.0", "docling-core": "2.88.0", "docling-ibm-models": "3.13.3", "docling-parse": "7.8.1"},
+        "observed_model_snapshot": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+        "model_bundles": {
+          "layout-heron": {"bytes": 171764371, "sha256": "8c3c9a5a112a8523528e124980b89f808f135bef68cb78757f396d531c05d796"},
+          "docling-models": {"bytes": 358236323, "sha256": "f03b36f44e7e7ac189f006c696290fdcbc607f76dd16b61b7513db9731f4d02f"}
+        },
+        "model_identity_limitation": "Observed after an uncontrolled first-use download; no preflight offline hash enforcement was used.",
+        "inference": {"successful": 12, "failed": 0, "avg_latency_ms": 7482.08},
+        "evaluation": {"successful": 12, "failed": 0, "skipped": 0},
+        "scores": {"normalized_text_score": 0.3570691434468524, "semantic_formatting": 0.3570691434468524, "grits_trm_composite": 0.0, "chart_data_point_pass_rate": 0.0, "layout_element_rule_pass_rate": 0.6943058076225045, "layout_attribution_pass_rate": 0.7027463159176714, "layout_map_50_95": 0.2818433048433049}
+      },
+      "mineru2605pro_local_mlx": {
+        "code_revision": "0dfc9460cd9ab693b9af60ae3fbffd7bc111b062",
+        "checkout_tag": "mineru-3.4.4-released",
+        "packages": {"mineru": "3.4.3", "mlx": "0.31.1", "mlx-vlm": "0.3.9", "transformers": "4.57.6", "torch": "2.13.0", "torchvision": "0.28.0"},
+        "model": {
+          "repository": "opendatalab/MinerU2.5-Pro-2605-1.2B",
+          "revision": "bff20d4ae2bf202df9f45284b4d43681555a97ed",
+          "files": 13,
+          "bytes": 2328028720,
+          "bundle_sha256": "dd52a7a95a5832428d2f6e5629ce6361ed0bca41fc54480d80dc9517702f4b62"
+        },
+        "license_note": "MinerU Open Source License adds commercial thresholds and online-service attribution obligations to Apache-2.0.",
+        "inference": {"successful": 12, "failed": 0, "batch_wall_seconds": 138.9, "approx_avg_latency_ms": 11575.0, "backend": "vlm-engine", "engine": "mlx"},
+        "evaluation": {"successful": 12, "failed": 0, "skipped": 0},
+        "scores": {"normalized_text_score": 0.3815789473684211, "semantic_formatting": 0.3815789473684211, "grits_trm_composite": 0.611288194818946, "chart_data_point_pass_rate": 0.3333333333333333, "layout_element_rule_pass_rate": 0.697595281306715, "layout_attribution_pass_rate": 0.7854402630617464, "layout_map_50_95": 0.42389116949461775}
+      }
+    }
+  },
+  "olmocr_bench": {
+    "evaluator_revision": "f7cfe4c22098b154c76b6ec950d1c0a464eecf8d",
+    "dataset_revision": "54a96a6fb6a2bd3b297e59869491db4d3625b711",
+    "candidate_documents": 1403,
+    "inference": {"successful": 1370, "failed": 33, "failed_candidates_retained_as_empty": true, "approx_avg_latency_ms": 3214.0},
+    "scored_tests": 8413,
+    "headline": {"average_of_per_jsonl_scores": 0.302, "bootstrap_95_ci_low": 0.293, "bootstrap_95_ci_high": 0.312, "bootstrap_samples": 1000},
+    "by_test_type": {"absent": {"score": 0.425, "tests": 823}, "baseline": {"score": 0.848, "tests": 1403}, "math": {"score": 0.0, "tests": 3385}, "order": {"score": 0.449, "tests": 1061}, "present": {"score": 0.257, "tests": 721}, "table": {"score": 0.104, "tests": 1020}},
+    "by_jsonl": {"arxiv_math": 0.0, "baseline": 0.849, "headers_footers": 0.376, "long_tiny_text": 0.419, "multi_column": 0.538, "old_scans": 0.133, "old_scans_math": 0.0, "table_tests": 0.105},
+    "failed_tests": 6106,
+    "evidence_path": "benchmarks/runs/olmocr-bench/pdf2md_local/failed.jsonl"
+  },
+  "rd_tablebench": {
+    "official_scorer_revision": "1cae108e6395ddc8389af17385f9769519070558",
+    "dataset_revision": "7748503e2bd5f210d27aa2ef5fdf4b8aa13099bb",
+    "dataset_license": "CC-BY-NC-ND-4.0",
+    "samples": 1000,
+    "mean_similarity": 0.0,
+    "median_similarity": 0.0,
+    "scored": 0,
+    "missing": 0,
+    "invalid_or_empty": 1000,
+    "failures_scored_as_zero": true,
+    "evidence_path": "benchmarks/runs/rd-tablebench/pdf2md_local/official-scores"
+  },
+  "normalization_note": "Optional ParseBench judge normalization was unavailable and skipped identically for all candidates; no hosted LLM was called."
+}

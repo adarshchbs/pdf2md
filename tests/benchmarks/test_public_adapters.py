@@ -11,6 +11,7 @@ from benchmarks.adapters.parsebench import export_parsebench_records, write_pars
 from benchmarks.adapters.rd_tablebench import (
     UnsupportedTableRepresentationError,
     export_rd_tablebench,
+    render_rd_tablebench_html,
 )
 from benchmarks.canonical import (
     CanonicalCell,
@@ -147,6 +148,20 @@ def test_olmocr_writes_verbatim_unicode_and_compact_html_with_stable_name(tmp_pa
     export_olmocr_bench([page], tmp_path, overwrite=True)
 
 
+def test_olmocr_writes_official_candidate_name_and_mirrors_pdf_subdirectory(tmp_path: Path) -> None:
+    page = _page(html_table=True)
+    mapping = {("doc-α", 0): Path("headers_footers/source.pdf")}
+
+    paths = export_olmocr_bench([page], tmp_path, file_mapping=mapping)
+
+    assert paths == [tmp_path / "headers_footers/source_pg1_repeat1.md"]
+    assert paths[0].read_text(encoding="utf-8") == page.markdown
+    with pytest.raises(ValueError, match="mapping IDs do not match"):
+        export_olmocr_bench([page], tmp_path / "bad", file_mapping={("wrong", 0): Path("x.pdf")})
+    with pytest.raises(ValueError, match="relative PDF path"):
+        export_olmocr_bench([page], tmp_path / "absolute", file_mapping={("doc-α", 0): Path("/x.pdf")})
+
+
 def test_rd_tablebench_exports_exact_compact_html_and_rejects_markdown() -> None:
     html_page = _page(html_table=True)
 
@@ -161,3 +176,13 @@ def test_rd_tablebench_exports_exact_compact_html_and_rejects_markdown() -> None
     assert export_rd_tablebench([html_page, continuation_page]) == first
     with pytest.raises(UnsupportedTableRepresentationError, match="unsupported for markdown-only"):
         export_rd_tablebench([_page()])
+
+
+def test_rd_tablebench_evaluation_projection_renders_canonical_grid_without_reference() -> None:
+    table = _page().tables[0]
+
+    rendered = render_rd_tablebench_html(table)
+
+    assert rendered == (
+        "<table><tr><th>都市</th><th>値</th></tr><tr><td>München</td><td>١٢</td></tr></table>"
+    )

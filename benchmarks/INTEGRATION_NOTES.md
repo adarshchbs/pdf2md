@@ -2,9 +2,9 @@
 
 ## Checkpoint state
 
-As of 2026-07-30 this directory includes a runnable synthetic development smoke harness, canonical normalization, local adapters, product metrics, and credential-free export boundaries for four public benchmarks. No external benchmark checkout, dataset, model, container, or service has been downloaded, invoked, or scored. The status values in `config/tools.yaml` are admission status, not benchmark results.
+As of 2026-07-31, the synthetic development harness remains available and pinned public evaluations have been reproduced locally. The full ParseBench snapshot was scored for pdf2md, PyMuPDF native text, and PyPDF native text. The small ParseBench snapshot was additionally scored with pinned Docling and MinerU 2.5 Pro. pdf2md was also scored with the official olmOCR-Bench and RD-TableBench evaluators. See `results/parsebench-2026-07-31.md` and its machine-readable JSON companion for metrics, revisions, failures, latency, limitations, and raw-evidence paths.
 
-`READY` currently covers only repository code (`our_parser`) and the PyMuPDF native-text baseline resolved by the existing lockfile. All other tools are deliberately `NOT_READY`. A successful smoke run establishes harness validity and local determinism only; it is not a parser-quality claim.
+Generated checkouts, datasets, models, and run artifacts remain ignored. They are evidence, not product fixtures, and must not enter parser rules or tests. The public scores do not turn the synthetic smoke into accuracy evidence and do not promote unrelated integration prototypes to official adapters.
 
 ## Admission gate for a future integration
 

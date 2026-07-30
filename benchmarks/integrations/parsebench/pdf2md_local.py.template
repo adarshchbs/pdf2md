@@ -1,0 +1,153 @@
+"""Local pdf2md provider copied into the pinned ParseBench checkout."""
+
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import pymupdf
+
+from app.pdf2md.engine import extract_document_with_catalog
+from app.pdf2md.schema import DocumentElement
+from parse_bench.inference.providers.base import Provider, ProviderPermanentError
+from parse_bench.inference.providers.registry import register_provider
+from parse_bench.schemas.parse_output import PageIR, ParseOutput
+from parse_bench.schemas.pipeline import PipelineSpec
+from parse_bench.schemas.pipeline_io import InferenceRequest, InferenceResult, RawInferenceResult
+from parse_bench.schemas.product import ProductType
+
+_LABELS = {
+    "paragraph": "text",
+    "heading": "heading",
+    "list_item": "text",
+    "table": "table",
+    "figure": "image",
+    "caption": "figure_title",
+    "footnote": "footnote",
+    "header": "header",
+    "footer": "footer",
+}
+
+
+@register_provider("pdf2md_local")
+class Pdf2mdLocalProvider(Provider):
+    """Run the repository's typed PyMuPDF parser without reference access."""
+
+    def run_inference(self, pipeline: PipelineSpec, request: InferenceRequest) -> RawInferenceResult:
+        if request.product_type != ProductType.PARSE:
+            raise ProviderPermanentError("pdf2md_local only supports PARSE")
+        pdf_path = Path(request.source_file_path)
+        if pdf_path.suffix.lower() != ".pdf" or not pdf_path.is_file():
+            raise ProviderPermanentError(f"PDF file not found: {pdf_path}")
+
+        started_at = datetime.now()
+        extracted = extract_document_with_catalog(pdf_path, annotator="parsebench-pdf2md-local")
+        cross_page_ids = [
+            element.element_id
+            for element in extracted.elements
+            if len({fragment.page_number for fragment in element.fragments}) > 1
+        ]
+        if cross_page_ids:
+            raise ProviderPermanentError(
+                "ParseBench page-local attribution cannot represent cross-page elements: "
+                f"{cross_page_ids}"
+            )
+        with pymupdf.open(pdf_path) as document:
+            page_sizes = [(float(page.rect.width), float(page.rect.height)) for page in document]
+        pages = [
+            _page_payload(page_number, page_sizes, extracted.elements)
+            for page_number in range(1, len(page_sizes) + 1)
+        ]
+        completed_at = datetime.now()
+        return RawInferenceResult(
+            request=request,
+            pipeline=pipeline,
+            pipeline_name=pipeline.pipeline_name,
+            product_type=request.product_type,
+            raw_output={
+                "pages": pages,
+                "source_catalog": extracted.source_catalog.model_dump(mode="json"),
+                "elements": [element.model_dump(mode="json") for element in extracted.elements],
+            },
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_in_ms=int((completed_at - started_at).total_seconds() * 1000),
+        )
+
+    def normalize(self, raw_result: RawInferenceResult) -> InferenceResult:
+        raw_pages = raw_result.raw_output["pages"]
+        pages = [PageIR(page_index=index, markdown=str(page["md"])) for index, page in enumerate(raw_pages)]
+        output = ParseOutput(
+            example_id=raw_result.request.example_id,
+            pipeline_name=raw_result.pipeline_name,
+            pages=pages,
+            markdown="\n\n".join(page.markdown for page in pages),
+        )
+        return InferenceResult(
+            request=raw_result.request,
+            pipeline_name=raw_result.pipeline_name,
+            product_type=raw_result.product_type,
+            raw_output=raw_result.raw_output,
+            output=output,
+            started_at=raw_result.started_at,
+            completed_at=raw_result.completed_at,
+            latency_in_ms=raw_result.latency_in_ms,
+        )
+
+
+def _page_payload(
+    page_number: int,
+    page_sizes: list[tuple[float, float]],
+    elements: list[DocumentElement],
+) -> dict[str, Any]:
+    width, height = page_sizes[page_number - 1]
+    page_elements = [
+        element
+        for element in elements
+        if any(fragment.page_number == page_number for fragment in element.fragments)
+    ]
+    markdown = "\n\n".join(
+        element.content for element in page_elements if element.include_in_output and element.content.strip()
+    )
+    items = []
+    for element in page_elements:
+        fragments = [fragment for fragment in element.fragments if fragment.page_number == page_number]
+        if not fragments:
+            continue
+        x0 = min(fragment.bbox.x0 for fragment in fragments)
+        y0 = min(fragment.bbox.y0 for fragment in fragments)
+        x1 = max(fragment.bbox.x1 for fragment in fragments)
+        y1 = max(fragment.bbox.y1 for fragment in fragments)
+        label = _LABELS.get(element.element_type, "text")
+        if element.element_type == "table":
+            item_type = "table"
+        elif element.element_type == "figure":
+            item_type = "image"
+        else:
+            item_type = "text"
+        value = element.content
+        items.append({
+            "type": item_type,
+            "value": value,
+            "md": value,
+            "html": value if element.format == "html" else "",
+            "layoutAwareBbox": [
+                {
+                    "x": x0,
+                    "y": y0,
+                    "w": x1 - x0,
+                    "h": y1 - y0,
+                    "confidence": element.annotation.confidence,
+                    "label": label,
+                    "startIndex": 0 if item_type == "text" and value else None,
+                    "endIndex": len(value) - 1 if item_type == "text" and value else None,
+                }
+            ],
+        })
+    return {
+        "page": page_number,
+        "width": width,
+        "height": height,
+        "md": markdown,
+        "text": markdown,
+        "items": items,
+    }
