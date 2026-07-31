@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
+import os
 import re
+import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal, cast
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import numpy as np
 import polars as pl
@@ -27,6 +31,21 @@ SALTS = {
 _LAYOUTLM = re.compile(r"layout\s*lm(?:v?2)?", re.IGNORECASE)
 _YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
 _NON_WORD = re.compile(r"[^a-z0-9]+")
+_PERCENT_ESCAPE = re.compile(r"%([0-9a-fA-F]{2})")
+_UNRESERVED_URL_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+_TRACKING_QUERY_PARAMETERS = frozenset({
+    "_ga",
+    "dclid",
+    "fbclid",
+    "gclid",
+    "jsessionid",
+    "mc_cid",
+    "mc_eid",
+    "msclkid",
+    "phpsessid",
+    "session",
+    "sessionid",
+})
 _FORBIDDEN_EVIDENCE_KEYS = {
     "accuracy_inspected",
     "bronze_inspected",
@@ -42,6 +61,7 @@ _FORBIDDEN_EVIDENCE_KEYS = {
 class BuildResult:
     manifest_path: Path
     partition_path: Path
+    descriptor_path: Path | None
     document_counts: dict[Split, int]
     page_counts: dict[Split, int]
     status: str
@@ -61,25 +81,172 @@ class _Group:
         return sum(int(document["page_count"]) for document in self.documents)
 
 
-def _read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+@dataclass(frozen=True)
+class _Snapshot:
+    path: Path
+    data: bytes
+    sha256: str
+    size_bytes: int
+    descriptor: int
+    identity: tuple[int, int, int, int]
+
+
+def _cleanup_cause(primary_error: BaseException, cleanup_error: BaseException) -> BaseException:
+    existing_cause = primary_error.__cause__
+    if existing_cause is None:
+        return cleanup_error
+    return BaseExceptionGroup(
+        f"primary error cleanup failures: {existing_cause}; {cleanup_error}",
+        [existing_cause, cleanup_error],
+    )
+
+
+_FINALIZER_CLOSE_DESCRIPTOR = os.close
+
+
+class _SnapshotStore:
+    """Hold stable, shared-locked descriptors for every metadata input."""
+
+    def __init__(self) -> None:
+        self._snapshots: dict[Path, _Snapshot] = {}
+
+    @staticmethod
+    def _identity(value: os.stat_result) -> tuple[int, int, int, int]:
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+    @staticmethod
+    def _read_descriptor(descriptor: int, size: int) -> bytes:
+        chunks: list[bytes] = []
+        offset = 0
+        while offset < size:
+            chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+        return b"".join(chunks)
+
+    def read(self, path: Path) -> _Snapshot:
+        resolved = path.resolve()
+        existing = self._snapshots.get(resolved)
+        if existing is not None:
+            return existing
+        descriptor = os.open(resolved, os.O_RDONLY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+            initial = os.fstat(descriptor)
+            data = self._read_descriptor(descriptor, initial.st_size)
+            opened = os.fstat(descriptor)
+            current = resolved.stat()
+            identity = self._identity(initial)
+            if identity != self._identity(opened) or identity != self._identity(current):
+                raise RuntimeError(f"metadata input changed while being read: {resolved}")
+            if len(data) != initial.st_size:
+                raise RuntimeError(f"metadata input was truncated while being read: {resolved}")
+            snapshot = _Snapshot(
+                resolved,
+                data,
+                hashlib.sha256(data).hexdigest(),
+                len(data),
+                descriptor,
+                identity,
+            )
+            self._snapshots[resolved] = snapshot
+            return snapshot
+        except BaseException as acquisition_error:
+            try:
+                os.close(descriptor)
+            except BaseException as close_error:
+                close_error.add_note(f"unclosed acquisition descriptor {descriptor}: {resolved}")
+                raise acquisition_error from _cleanup_cause(acquisition_error, close_error)
+            raise
+
+    def revalidate(self) -> None:
+        for snapshot in self._snapshots.values():
+            try:
+                before = os.fstat(snapshot.descriptor)
+                current = self._read_descriptor(snapshot.descriptor, before.st_size)
+                after = os.fstat(snapshot.descriptor)
+                path_stat = snapshot.path.stat()
+            except (FileNotFoundError, OSError) as error:
+                raise RuntimeError(
+                    f"metadata input disappeared before publication: {snapshot.path}"
+                ) from error
+            if (
+                self._identity(before) != snapshot.identity
+                or self._identity(after) != snapshot.identity
+                or self._identity(path_stat) != snapshot.identity
+                or current != snapshot.data
+            ):
+                raise RuntimeError(f"metadata input changed before publication: {snapshot.path}")
+
+    def close(self) -> None:
+        owned_snapshots, self._snapshots = self._snapshots, {}
+        failures: list[BaseException] = []
+        for snapshot in owned_snapshots.values():
+            try:
+                os.close(snapshot.descriptor)
+            except BaseException as error:
+                error.add_note(f"snapshot descriptor {snapshot.descriptor}: {snapshot.path}")
+                failures.append(error)
+        if failures:
+            raise BaseExceptionGroup("snapshot descriptor close failures", failures)
+
+    def __del__(self) -> None:
+        try:
+            owned_snapshots, self._snapshots = self._snapshots, {}
+        except BaseException:
+            return
+        for snapshot in owned_snapshots.values():
+            try:
+                _FINALIZER_CLOSE_DESCRIPTOR(snapshot.descriptor)
+            except BaseException:
+                pass
+
+
+def _close_snapshot_store(snapshots: _SnapshotStore, primary_error: BaseException | None) -> None:
+    try:
+        snapshots.close()
+    except BaseException as close_error:
+        if primary_error is not None:
+            raise primary_error from _cleanup_cause(primary_error, close_error)
+        raise
+
+
+def _decode_json(snapshot: _Snapshot) -> Any:
+    try:
+        return json.loads(snapshot.data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid JSON metadata: {snapshot.path}: {error}") from error
+
+
+def _json_from_snapshot(snapshot: _Snapshot) -> dict[str, Any]:
+    value = _decode_json(snapshot)
     if not isinstance(value, dict):
-        raise ValueError(f"expected a JSON object: {path}")
+        raise ValueError(f"expected a JSON object: {snapshot.path}")
     return cast(dict[str, Any], value)
 
 
-def _read_records(path: Path) -> list[dict[str, Any]]:
+def _records_from_snapshot(snapshot: _Snapshot) -> list[dict[str, Any]]:
+    path = snapshot.path
     if path.suffix == ".jsonl":
         records: list[dict[str, Any]] = []
-        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            text = snapshot.data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"invalid UTF-8 metadata: {path}: {error}") from error
+        for line_number, line in enumerate(text.splitlines(), 1):
             if not line.strip():
                 continue
-            value = json.loads(line)
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid JSON at {path}:{line_number}: {error}") from error
             if not isinstance(value, dict):
                 raise ValueError(f"expected JSON object at {path}:{line_number}")
             records.append(cast(dict[str, Any], value))
         return records
-    manifest = _read_json(path)
+    manifest = _json_from_snapshot(snapshot)
     documents = manifest.get("documents")
     if not isinstance(documents, list):
         raise ValueError(f"manifest has no documents array: {path}")
@@ -89,21 +256,58 @@ def _read_records(path: Path) -> list[dict[str, Any]]:
     return [cast(dict[str, Any], document) for document in documents]
 
 
-def _digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _read_json(path: Path) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    snapshots = _SnapshotStore()
+    primary_error: BaseException | None = None
+    try:
+        return _json_from_snapshot(snapshots.read(path))
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _close_snapshot_store(snapshots, primary_error)
+
+
+def _read_records(path: Path) -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
+    snapshots = _SnapshotStore()
+    primary_error: BaseException | None = None
+    try:
+        return _records_from_snapshot(snapshots.read(path))
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _close_snapshot_store(snapshots, primary_error)
 
 
 def _normalized(value: str) -> str:
     return _NON_WORD.sub(" ", value.lower()).strip()
 
 
+def _normalize_url_path(raw_path: str) -> str:
+    def normalize_escape(match: re.Match[str]) -> str:
+        value = int(match.group(1), 16)
+        character = chr(value)
+        return character if character in _UNRESERVED_URL_CHARACTERS else f"%{value:02X}"
+
+    normalized_escapes = _PERCENT_ESCAPE.sub(normalize_escape, raw_path)
+    return quote(normalized_escapes, safe="/%:@!$&'()*+,;=-._~").rstrip("/")
+
+
 def _normalize_url_value(raw_url: str) -> str:
     parsed = urlsplit(raw_url.strip())
+    semantic_query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_key = key.casefold()
+        if normalized_key.startswith("utm_") or normalized_key in _TRACKING_QUERY_PARAMETERS:
+            continue
+        semantic_query.append((key, value))
+    semantic_query.sort()
     return urlunsplit((
         parsed.scheme.casefold(),
         parsed.netloc.casefold(),
-        unquote(parsed.path).rstrip("/"),
-        "",
+        _normalize_url_path(parsed.path),
+        urlencode(semantic_query, doseq=True, quote_via=quote),
         "",
     ))
 
@@ -114,21 +318,14 @@ def _derived_normalized_url(document: dict[str, Any]) -> str:
 
 
 def _derived_title_publisher_key(document: dict[str, Any]) -> tuple[str, str]:
-    explicit = (
-        document.get("source_producer")
-        or document.get("producer")
-        or document.get("issuer")
-        or document.get("jurisdiction_or_publisher")
-    )
-    publisher = str(explicit or "")
     title = str(document.get("normalized_title") or document.get("title") or "")
-    return _normalized(publisher), _normalized(title)
+    return _producer(document), _normalized(title)
 
 
 def _normalized_url(document: dict[str, Any]) -> str:
     deduplication_keys = document.get("deduplication_keys")
     curated_url = deduplication_keys.get("normalized_url") if isinstance(deduplication_keys, dict) else None
-    raw_url = str(curated_url or document.get("canonical_url") or document.get("source_url") or "").strip()
+    raw_url = str(document.get("source_url") or document.get("canonical_url") or curated_url or "").strip()
     return _normalize_url_value(raw_url) if raw_url else ""
 
 
@@ -202,8 +399,14 @@ def _atomic_keys(document: dict[str, Any]) -> tuple[str, ...]:
     keys = {
         f"sha256:{document.get('sha256', '')}",
         f"url:{_normalized_url(document)}",
-        f"title:{_normalized(str(document.get('normalized_title') or document.get('title') or ''))}",
-        f"template:{_normalized(str(document.get('template_family') or document.get('family_id') or ''))}",
+        (
+            f"publisher-title:{producer}|"
+            f"{_normalized(str(document.get('normalized_title') or document.get('title') or ''))}"
+        ),
+        (
+            f"publisher-template:{producer}|"
+            f"{_normalized(str(document.get('template_family') or document.get('family_id') or ''))}"
+        ),
     }
     report_series = _normalized(str(document.get("report_series") or ""))
     edition = _normalized(str(document.get("edition") or ""))
@@ -214,10 +417,7 @@ def _atomic_keys(document: dict[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(key for key in keys if not key.endswith(":")))
 
 
-def _atomic_groups(
-    fixed: list[dict[str, Any]], new_documents: list[dict[str, Any]], revision: str
-) -> tuple[list[dict[str, Any]], list[_Group]]:
-    documents = fixed + new_documents
+def _atomic_components(documents: list[dict[str, Any]]) -> list[tuple[str, list[int]]]:
     parent = list(range(len(documents)))
 
     def find(index: int) -> int:
@@ -240,15 +440,48 @@ def _atomic_groups(
     components: dict[int, list[int]] = defaultdict(list)
     for index in range(len(documents)):
         components[find(index)].append(index)
+    ordered = sorted(components.values(), key=lambda values: min(str(documents[i]["sha256"]) for i in values))
+    return [
+        (
+            "atomic-v3:"
+            + hashlib.sha256(
+                "|".join(sorted(str(documents[index]["sha256"]) for index in indices)).encode()
+            ).hexdigest()[:24],
+            indices,
+        )
+        for indices in ordered
+    ]
 
+
+def _family_declarations(
+    documents: list[dict[str, Any]], fixed_hashes: set[str]
+) -> tuple[int, list[dict[str, Any]]]:
+    forced_count = 0
+    conflicts: list[dict[str, Any]] = []
+    for component_id, indices in _atomic_components(documents):
+        fixed_members = [documents[index] for index in indices if documents[index]["sha256"] in fixed_hashes]
+        new_members = [
+            documents[index] for index in indices if documents[index]["sha256"] not in fixed_hashes
+        ]
+        fixed_splits = {str(document["split"]) for document in fixed_members}
+        if len(fixed_splits) > 1:
+            conflicts.append({
+                "family_id": component_id,
+                "fixed_splits": sorted(fixed_splits, key=SPLITS.index),
+            })
+        elif fixed_members:
+            forced_count += len(new_members)
+    return forced_count, conflicts
+
+
+def _atomic_groups(
+    fixed: list[dict[str, Any]], new_documents: list[dict[str, Any]], revision: str
+) -> tuple[list[dict[str, Any]], list[_Group]]:
+    documents = fixed + new_documents
     forced_new: list[dict[str, Any]] = []
     variable_groups: list[_Group] = []
     fixed_count = len(fixed)
-    for indices in sorted(
-        components.values(), key=lambda values: min(str(documents[i]["sha256"]) for i in values)
-    ):
-        component_hashes = sorted(str(documents[index]["sha256"]) for index in indices)
-        component_id = "atomic-v3:" + hashlib.sha256("|".join(component_hashes).encode()).hexdigest()[:24]
+    for component_id, indices in _atomic_components(documents):
         for index in indices:
             document = documents[index]
             document.setdefault("source_family_id", str(document.get("family_id", "")))
@@ -346,20 +579,40 @@ def _checkpoint_kind(path: Path) -> Literal["difficult", "financial", "gap"] | N
         return None
     if path.parent.name == "v3-difficult":
         return "difficult"
-    if path.parent.name in ("v3-financial", "v3-financial-r2"):
+    if path.parent.name in ("v3-financial", "v3-financial-r2", "v3-financial-r3"):
         return "financial"
     if path.parent.name == "v3-gap":
         return "gap"
     return None
 
 
-def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+def _load_jsonl(path: Path, snapshots: _SnapshotStore) -> list[dict[str, Any]]:
     if not path.is_file():
         raise ValueError(f"checkpoint companion is missing: {path}")
-    return _read_records(path)
+    return _records_from_snapshot(snapshots.read(path))
 
 
-def _validate_checkpoint(path: Path, records: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _validate_source_binding(
+    *,
+    kind: str,
+    outcome_kind: str,
+    identity: object,
+    source: dict[str, Any],
+    outcome: dict[str, Any],
+) -> None:
+    missing = sorted(source.keys() - outcome.keys())
+    if missing:
+        raise ValueError(f"v3 {kind} {outcome_kind} outcome omits source metadata {identity}: {missing}")
+    altered = sorted(key for key, value in source.items() if outcome[key] != value)
+    if altered:
+        raise ValueError(f"v3 {kind} {outcome_kind} outcome alters source metadata {identity}: {altered}")
+
+
+def _validate_checkpoint_with_snapshots(
+    path: Path,
+    records: list[dict[str, Any]],
+    snapshots: _SnapshotStore,
+) -> dict[str, Any] | None:
     kind = _checkpoint_kind(path)
     if kind is None:
         return None
@@ -368,19 +621,24 @@ def _validate_checkpoint(path: Path, records: list[dict[str, Any]]) -> dict[str,
         "source_manifest.jsonl" if kind in ("difficult", "gap") else "source_manifest.json"
     )
     rejected_path = path.with_name("rejected_manifest.jsonl")
-    for companion in (summary_path, source_path, rejected_path):
-        if not companion.is_file():
-            raise ValueError(f"checkpoint companion is missing: {companion}")
-    if summary_path.stat().st_mtime_ns < path.stat().st_mtime_ns:
+    try:
+        accepted_snapshot = snapshots.read(path)
+        summary_snapshot = snapshots.read(summary_path)
+        source_snapshot = snapshots.read(source_path)
+        snapshots.read(rejected_path)
+    except FileNotFoundError as error:
+        raise ValueError(f"checkpoint companion is missing: {error.filename}") from error
+    if records != _records_from_snapshot(accepted_snapshot):
+        raise ValueError("accepted checkpoint records do not match its stable byte snapshot")
+    if summary_snapshot.identity[3] < accepted_snapshot.identity[3]:
         raise ValueError(f"checkpoint summary is stale relative to accepted manifest: {path}")
-    if path.stat().st_mtime_ns < source_path.stat().st_mtime_ns:
+    if accepted_snapshot.identity[3] < source_snapshot.identity[3]:
         raise ValueError(f"accepted manifest is stale relative to source manifest: {path}")
 
-    summary = _read_json(summary_path)
-    rejected = _load_jsonl(rejected_path)
-    accepted_urls = {str(row.get("source_url", "")) for row in records}
+    summary = _json_from_snapshot(summary_snapshot)
+    rejected = _load_jsonl(rejected_path, snapshots)
     if kind in ("difficult", "gap"):
-        sources = _load_jsonl(source_path)
+        sources = _load_jsonl(source_path, snapshots)
         expected_task = 43 if kind == "difficult" else 48
         if summary.get("task") != expected_task:
             raise ValueError(f"v3 {kind} checkpoint does not identify completed task {expected_task}")
@@ -391,10 +649,36 @@ def _validate_checkpoint(path: Path, records: list[dict[str, Any]]) -> dict[str,
         )
         if expected != (len(sources), len(records), len(rejected)):
             raise ValueError(f"v3 {kind} checkpoint completeness counts do not match")
-        if {str(row.get("slug", "")) for row in sources} != {
-            str(row.get("slug", "")) for row in records + rejected
-        }:
-            raise ValueError(f"v3 {kind} checkpoint outcomes do not cover its sources")
+        source_by_slug = {str(row.get("slug", "")).strip(): row for row in sources}
+        accepted_by_slug = {str(row.get("slug", "")).strip(): row for row in records}
+        rejected_by_slug = {str(row.get("slug", "")).strip(): row for row in rejected}
+        for label, rows, by_slug in (
+            ("source", sources, source_by_slug),
+            ("accepted", records, accepted_by_slug),
+            ("rejected", rejected, rejected_by_slug),
+        ):
+            if "" in by_slug:
+                raise ValueError(f"v3 {kind} {label} manifest contains a blank slug")
+            if len(by_slug) != len(rows):
+                raise ValueError(f"v3 {kind} {label} manifest contains duplicate slugs")
+        if accepted_by_slug.keys() & rejected_by_slug.keys():
+            raise ValueError(f"v3 {kind} accepted and rejected outcomes are not disjoint")
+        if source_by_slug.keys() != accepted_by_slug.keys() | rejected_by_slug.keys():
+            raise ValueError(f"v3 {kind} outcomes do not exactly cover source slugs")
+        for outcome_kind, outcomes in (
+            ("accepted", accepted_by_slug),
+            ("rejected", rejected_by_slug),
+        ):
+            for slug, outcome in outcomes.items():
+                _validate_source_binding(
+                    kind=kind,
+                    outcome_kind=outcome_kind,
+                    identity=slug,
+                    source=source_by_slug[slug],
+                    outcome=outcome,
+                )
+        if any(row.get("status") != "rejected" for row in rejected):
+            raise ValueError(f"v3 {kind} rejected checkpoint contains a non-rejected record")
         if int(summary.get("accepted_page_count", -1)) != sum(int(row["page_count"]) for row in records):
             raise ValueError(f"v3 {kind} checkpoint page total does not match")
         if int(summary.get("accepted_size_bytes", -1)) != sum(int(row["size_bytes"]) for row in records):
@@ -409,9 +693,8 @@ def _validate_checkpoint(path: Path, records: list[dict[str, Any]]) -> dict[str,
             for row in records
         ):
             raise ValueError("v3 gap checkpoint lacks record-level uninspected/unassigned attestations")
-        source_urls = {str(row.get("source_url", "")) for row in sources}
     else:
-        source = _read_json(source_path)
+        source = _json_from_snapshot(snapshots.read(source_path))
         sources_value = source.get("sources")
         if not isinstance(sources_value, list):
             raise ValueError("v3 financial source manifest has no sources array")
@@ -421,35 +704,50 @@ def _validate_checkpoint(path: Path, records: list[dict[str, Any]]) -> dict[str,
         sources = [cast(dict[str, Any], row) for row in sources_value]
         if source.get("candidate_status") != "unassigned" or source.get("accuracy_inspected") is not False:
             raise ValueError("v3 financial checkpoint lacks an uninspected/unassigned attestation")
-        expected_counts = (540, 171, 369)
         actual_counts = (len(sources), len(records), len(rejected))
         summary_counts = (
             int(summary.get("source_count", -1)),
             int(summary.get("accepted", -1)),
             int(summary.get("rejected", -1)),
         )
-        if actual_counts != expected_counts or summary_counts != expected_counts:
+        if summary_counts != actual_counts or len(sources) != len(records) + len(rejected):
             raise ValueError(
                 "v3 financial checkpoint completeness counts do not match "
-                f"the required source/accepted/rejected counts: {actual_counts}"
+                f"source/accepted/rejected records: {actual_counts}"
             )
-        source_identities = [
-            (str(row.get("id", "")).strip(), str(row.get("source_url", "")).strip()) for row in sources
-        ]
-        outcome_identities = [
-            (str(row.get("id", "")).strip(), str(row.get("source_url", "")).strip())
-            for row in records + rejected
-        ]
-        if any(not source_id or not source_url for source_id, source_url in source_identities):
-            raise ValueError("v3 financial source manifest contains a blank source identity")
-        if any(not source_id or not source_url for source_id, source_url in outcome_identities):
-            raise ValueError("v3 financial outcome manifest contains a blank source identity")
-        if len(set(source_identities)) != len(source_identities):
-            raise ValueError("v3 financial source manifest contains duplicate source identities")
-        if len(set(outcome_identities)) != len(outcome_identities):
-            raise ValueError("v3 financial outcome manifests contain duplicate source identities")
-        if set(source_identities) != set(outcome_identities):
-            raise ValueError("v3 financial outcomes do not exactly cover source identities")
+
+        def financial_identity(row: dict[str, Any]) -> tuple[str, str]:
+            canonical_url = _normalize_url_value(str(row.get("canonical_url") or row.get("source_url") or ""))
+            return canonical_url, str(row.get("id", "")).strip()
+
+        source_by_url = {financial_identity(row): row for row in sources}
+        accepted_by_url = {financial_identity(row): row for row in records}
+        rejected_by_url = {financial_identity(row): row for row in rejected}
+        for label, rows, by_url in (
+            ("source", sources, source_by_url),
+            ("accepted", records, accepted_by_url),
+            ("rejected", rejected, rejected_by_url),
+        ):
+            if any(not url or not source_id for url, source_id in by_url):
+                raise ValueError(f"v3 financial {label} manifest contains a blank canonical identity")
+            if len(by_url) != len(rows):
+                raise ValueError(f"v3 financial {label} manifest contains duplicate canonical identities")
+        if accepted_by_url.keys() & rejected_by_url.keys():
+            raise ValueError("v3 financial accepted and rejected outcomes are not disjoint")
+        if source_by_url.keys() != accepted_by_url.keys() | rejected_by_url.keys():
+            raise ValueError("v3 financial outcomes do not exactly cover source canonical URLs")
+        for outcome_kind, outcomes in (
+            ("accepted", accepted_by_url),
+            ("rejected", rejected_by_url),
+        ):
+            for canonical_identity, outcome in outcomes.items():
+                _validate_source_binding(
+                    kind="financial",
+                    outcome_kind=outcome_kind,
+                    identity=canonical_identity,
+                    source=source_by_url[canonical_identity],
+                    outcome=outcome,
+                )
         if any(row.get("status") != "rejected" for row in rejected):
             raise ValueError("v3 financial rejected checkpoint contains a non-rejected record")
         if any(not str(row.get("rejection_reason", "")).strip() for row in rejected):
@@ -465,20 +763,35 @@ def _validate_checkpoint(path: Path, records: list[dict[str, Any]]) -> dict[str,
             raise ValueError("v3 financial checkpoint ordered hash digest does not match")
         if any(row.get("candidate_status") != "unassigned" for row in records):
             raise ValueError("v3 financial checkpoint contains an assigned candidate")
-        source_urls = {str(row.get("source_url", "")) for row in sources}
-    if not accepted_urls <= source_urls:
-        raise ValueError(f"{kind} accepted checkpoint contains a source not in its source manifest")
     if any(row.get("status") != "accepted" for row in records):
         raise ValueError(f"{kind} accepted checkpoint contains a non-accepted record")
     return {
         "kind": kind,
         "summary_path": str(summary_path),
-        "summary_sha256": _digest(summary_path),
+        "summary_sha256": snapshots.read(summary_path).sha256,
         "source_path": str(source_path),
-        "source_sha256": _digest(source_path),
+        "source_sha256": snapshots.read(source_path).sha256,
         "rejected_path": str(rejected_path),
-        "rejected_sha256": _digest(rejected_path),
+        "rejected_sha256": snapshots.read(rejected_path).sha256,
     }
+
+
+def _validate_checkpoint(
+    path: Path,
+    records: list[dict[str, Any]],
+    snapshots: _SnapshotStore | None = None,
+) -> dict[str, Any] | None:
+    if snapshots is not None:
+        return _validate_checkpoint_with_snapshots(path, records, snapshots)
+    owned_snapshots = _SnapshotStore()
+    primary_error: BaseException | None = None
+    try:
+        return _validate_checkpoint_with_snapshots(path, records, owned_snapshots)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _close_snapshot_store(owned_snapshots, primary_error)
 
 
 def _adapt_checkpoint_document(document: dict[str, Any], path: Path) -> dict[str, Any]:
@@ -581,23 +894,17 @@ def _validate_new_document(document: dict[str, Any], source: Path) -> None:
 
 
 def document_targets(total: int) -> dict[Split, int]:
-    """Return Hamilton largest-remainder targets with split order as the exact tie-break."""
+    """Round TRAIN and validation half-up, then assign the residual to holdout."""
     if total < 0:
         raise ValueError("total document count cannot be negative")
-    ratio_fractions: dict[Split, Fraction] = {
-        "train": Fraction(3, 5),
-        "validation": Fraction(1, 10),
-        "holdout": Fraction(3, 10),
-    }
-    quotas = {split: total * ratio_fractions[split] for split in SPLITS}
-    targets: dict[Split, int] = {
-        split: quotas[split].numerator // quotas[split].denominator for split in SPLITS
-    }
-    remainder = total - sum(targets.values())
-    ranked = sorted(SPLITS, key=lambda split: (-(quotas[split] - targets[split]), SPLITS.index(split)))
-    for split in ranked[:remainder]:
-        targets[split] += 1
-    return targets
+
+    def half_up(value: Fraction) -> int:
+        quotient, remainder = divmod(value.numerator, value.denominator)
+        return quotient + int(remainder * 2 >= value.denominator)
+
+    train = half_up(total * Fraction(3, 5))
+    validation = half_up(total * Fraction(1, 10))
+    return {"train": train, "validation": validation, "holdout": total - train - validation}
 
 
 def _reachable_targets(
@@ -777,6 +1084,30 @@ def _optimize(
     return assignments
 
 
+def _partition_policy(revision: str) -> dict[str, Any]:
+    return {
+        "ratios": RATIOS,
+        "ratio_basis": "document count after SHA-256 consolidation and LayoutLM-family exclusion",
+        "rounding": (
+            "TRAIN at 3/5 and validation at 1/10 are rounded independently half-up; "
+            "holdout receives the exact residual"
+        ),
+        "partition_salt": SALTS[revision],
+        "assignment_priority": (
+            "exact half-up/residual document targets; strata balance; page balance; salted tie-break"
+        ),
+        "family_rule": (
+            "transitive atomic components over SHA-256, canonical URL, normalized title, "
+            "publisher/report series, producer/edition, and template family; new members of an "
+            "existing component inherit its fixed split"
+        ),
+        "holdout_evidence_rule": (
+            "manifest metadata only; no candidate output, bronze, silver, evaluation, element "
+            "failures, validation PDFs, or holdout PDFs inspected"
+        ),
+    }
+
+
 def _summary(documents: list[dict[str, Any]]) -> dict[str, Any]:
     frame = pl.DataFrame({
         "split": [str(document["split"]) for document in documents],
@@ -839,42 +1170,78 @@ def _strata_summary(documents: list[dict[str, Any]]) -> dict[str, list[dict[str,
 
 
 def _verify(
-    documents: list[dict[str, Any]], previous_partition: dict[str, Any], targets: dict[Split, int]
+    documents: list[dict[str, Any]],
+    parent_manifest: dict[str, Any],
+    previous_partition: dict[str, Any],
+    targets: dict[Split, int],
+    *,
+    parent_source_manifest: str,
+    strict_document_schema: bool = True,
 ) -> list[str]:
-    ids = [str(document["id"]) for document in documents]
+    parent_documents = cast(list[dict[str, Any]], parent_manifest["documents"])
+    previous_documents = cast(list[dict[str, Any]], previous_partition["documents"])
+    expected_parent = _expected_parent_splits(parent_documents, previous_documents)
+    fixed_hashes = set(expected_parent)
+    for index, document in enumerate(documents):
+        if strict_document_schema and str(document.get("sha256", "")) not in fixed_hashes:
+            _validate_new_document(document, Path(f"output.documents[{index}]"))
+        if document.get("split") not in SPLITS:
+            raise ValueError(f"output document has invalid split: {document.get('id', index)}")
+        for field in ("id", "family_id", "assignment_origin", "assignment_rationale"):
+            if not str(document.get(field, "")).strip():
+                raise ValueError(f"output document has blank {field}: {document.get('id', index)}")
+    ids = [str(document["id"]).strip() for document in documents]
     hashes = [str(document["sha256"]) for document in documents]
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate document IDs after consolidation")
     if len(hashes) != len(set(hashes)):
         raise ValueError("duplicate SHA-256 values after consolidation")
+    canonical_urls = [_derived_normalized_url(document) for document in documents]
+    canonical_urls = [url for url in canonical_urls if url]
+    if len(canonical_urls) != len(set(canonical_urls)):
+        raise ValueError("duplicate canonical URLs after consolidation")
+    title_publishers = [_derived_title_publisher_key(document) for document in documents]
+    if len(title_publishers) != len(set(title_publishers)):
+        raise ValueError("duplicate normalized title and publisher after consolidation")
     if any(_is_layoutlm(document) for document in documents):
         raise ValueError("LayoutLM/LayoutLMv2 remained in active corpus")
+    parent_by_sha = {str(document["sha256"]): document for document in parent_documents}
+    previous_by_sha = {str(document["sha256"]): document for document in previous_documents}
     by_sha = {str(document["sha256"]): document for document in documents}
-    for previous in cast(list[dict[str, Any]], previous_partition["documents"]):
-        current = by_sha.get(str(previous["sha256"]))
-        if current is None and not _is_layoutlm(previous):
-            raise ValueError(f"previous-partition member missing: {previous['id']}")
-        if current is not None:
-            expected: Split = "train" if previous["split"] == "dev" else cast(Split, previous["split"])
-            if current["split"] != expected:
-                raise ValueError(f"previous-partition membership changed for {previous['id']}")
-    new_family_splits: dict[str, set[str]] = defaultdict(set)
-    fixed_family_splits: dict[str, set[str]] = defaultdict(set)
-    for document in documents:
-        family = str(document["family_id"])
-        if str(document["assignment_origin"]).startswith("new-v"):
-            new_family_splits[family].add(str(document["split"]))
-        else:
-            fixed_family_splits[family].add(str(document["split"]))
-    leaking = {family: splits for family, splits in new_family_splits.items() if len(splits) > 1}
-    if leaking:
-        raise ValueError(f"new family leakage detected: {leaking}")
-    for family, new_splits in new_family_splits.items():
-        prior_splits = fixed_family_splits.get(family, set())
-        if prior_splits and "train" in prior_splits and new_splits != {"train"}:
-            raise ValueError(f"new member of burned TRAIN family escaped TRAIN: {family}")
-        if len(prior_splits) == 1 and new_splits != prior_splits:
-            raise ValueError(f"new member crossed an existing family boundary: {family}")
+    for sha256, (expected_id, expected_split) in expected_parent.items():
+        current = by_sha.get(sha256)
+        if current is None:
+            raise ValueError(f"parent-manifest member missing: {expected_id}")
+        if current["id"] != expected_id:
+            raise ValueError(f"parent-manifest member relabeled: {expected_id}")
+        parent_document = parent_by_sha[sha256]
+        previous = previous_by_sha.get(sha256)
+        if current["split"] != expected_split:
+            raise ValueError(f"parent-manifest membership changed for {expected_id}")
+        expected_output = _fixed_parent_output(
+            parent_document,
+            source_manifest=parent_source_manifest,
+            split=expected_split,
+            previous_split=previous.get("split") if previous is not None else None,
+        )
+        expected_output["family_id"] = current["family_id"]
+        if current != expected_output:
+            raise ValueError(f"authenticated parent metadata changed for {expected_id}")
+
+    for component_id, indices in _atomic_components(documents):
+        component = [documents[index] for index in indices]
+        if any(document["family_id"] != component_id for document in component):
+            raise ValueError(f"committed family_id does not match atomic component: {component_id}")
+        fixed_members = [document for document in component if document["sha256"] in fixed_hashes]
+        new_members = [document for document in component if document["sha256"] not in fixed_hashes]
+        fixed_splits = {str(document["split"]) for document in fixed_members}
+        new_splits = {str(document["split"]) for document in new_members}
+        if len(fixed_splits) > 1 and new_members:
+            raise ValueError(f"new documents join a grandfathered conflicting family: {component_id}")
+        if len(fixed_splits) == 1 and new_splits and new_splits != fixed_splits:
+            raise ValueError(f"new member crossed an existing family boundary: {component_id}")
+        if not fixed_members and len(new_splits) > 1:
+            raise ValueError(f"new family leakage detected: {component_id}")
     counts = {split: sum(document["split"] == split for document in documents) for split in SPLITS}
     if counts != targets:
         raise ValueError(f"document counts do not match selected targets: {counts} != {targets}")
@@ -884,9 +1251,116 @@ def _verify(
         "LayoutLM and LayoutLMv2 absent from active corpus",
         "every partition-v2 membership and previously burned TRAIN assignment preserved",
         "new hash/URL/title/report-series/edition/template components assigned atomically",
-        "document counts equal exact Hamilton targets",
+        "document counts equal exact half-up/residual targets",
         "new candidates are checkpoint-attested accuracy-uninspected and unassigned",
     ]
+
+
+def _validate_output_contract(
+    *,
+    manifest: dict[str, Any],
+    partition: dict[str, Any],
+    parent_manifest: dict[str, Any],
+    parent_partition: dict[str, Any],
+    revision: str,
+) -> None:
+    if manifest.get("policy") != _partition_policy(revision):
+        raise ValueError("output policy does not match the revision policy")
+    documents_value = manifest.get("documents")
+    if not isinstance(documents_value, list) or any(
+        not isinstance(document, dict) for document in documents_value
+    ):
+        raise ValueError("output documents must be an array of objects")
+    documents = cast(list[dict[str, Any]], documents_value)
+    ideal_targets = document_targets(len(documents))
+    if manifest.get("ideal_document_targets") != ideal_targets:
+        raise ValueError("ideal document targets do not match the output corpus")
+    if manifest.get("selected_document_targets") != ideal_targets:
+        raise ValueError("selected document targets do not match exact half-up/residual targets")
+    if manifest.get("ideal_targets_family_reachable") is not True:
+        raise ValueError("final output does not attest reachable exact family targets")
+    parent_documents, previous_documents = _validate_parent_relationship(parent_manifest, parent_partition)
+    checks = _verify(
+        documents,
+        parent_manifest,
+        parent_partition,
+        ideal_targets,
+        parent_source_manifest=str(manifest["parent_manifest"]["path"]),
+    )
+    if manifest.get("integrity_checks") != checks:
+        raise ValueError("integrity checks do not match recomputed output checks")
+    if manifest.get("summary") != _summary(documents):
+        raise ValueError("output summary does not match committed documents")
+    expected_parent = _expected_parent_splits(parent_documents, previous_documents)
+    fixed_hashes = set(expected_parent)
+    forced_count, conflicts = _family_declarations(documents, fixed_hashes)
+    if manifest.get("new_documents_forced_by_existing_family") != forced_count:
+        raise ValueError("forced-by-existing-family count does not match atomic components")
+    if manifest.get("grandfathered_fixed_family_conflicts") != conflicts:
+        raise ValueError("grandfathered fixed-family conflicts do not match parent state")
+    previously_active = len(expected_parent)
+    expected_selection = {
+        "previously_active_documents": previously_active,
+        "new_accuracy_uninspected_documents": len(documents) - previously_active,
+        "retained_unique_documents": len(documents),
+    }
+    if manifest.get("selection") != expected_selection:
+        raise ValueError("output selection counts do not match committed documents")
+    if partition.get("strata_summary") != _strata_summary(documents):
+        raise ValueError("partition strata summary does not match committed documents")
+
+
+def _descriptor_record_count(snapshot: _Snapshot) -> int:
+    if snapshot.path.suffix == ".jsonl":
+        return len(_records_from_snapshot(snapshot))
+    payload = _json_from_snapshot(snapshot)
+    for key in ("documents", "sources"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return len(value)
+    return 1
+
+
+def _commitment_descriptor(
+    *, role: str, path: Path, root_dir: Path, snapshots: _SnapshotStore
+) -> dict[str, Any]:
+    snapshot = snapshots.read(path)
+    return {
+        "role": role,
+        "path": str(path.resolve().relative_to(root_dir.resolve())),
+        "sha256": snapshot.sha256,
+        "size_bytes": snapshot.size_bytes,
+        "record_count": _descriptor_record_count(snapshot),
+    }
+
+
+def _validate_sidecar_descriptor(
+    *,
+    label: str,
+    payload: object,
+    expected_path: Path,
+    root_dir: Path,
+    snapshots: _SnapshotStore,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError(f"revision sidecar {label} descriptor must be an object")
+    required = {"path", "sha256", "size_bytes", "record_count"}
+    missing = sorted(required - payload.keys())
+    if missing:
+        raise ValueError(f"revision sidecar {label} is missing {', '.join(missing)}")
+    described_path = (root_dir / str(payload["path"])).resolve()
+    try:
+        described_path.relative_to(root_dir.resolve())
+    except ValueError as error:
+        raise ValueError(f"revision sidecar {label} escapes repository root") from error
+    if described_path != expected_path.resolve():
+        raise ValueError(f"revision sidecar {label} does not describe the expected checkpoint file")
+    snapshot = snapshots.read(described_path)
+    if payload["sha256"] != snapshot.sha256 or payload["size_bytes"] != snapshot.size_bytes:
+        raise ValueError(f"revision sidecar {label} hash/size mismatch: {described_path}")
+    if payload["record_count"] != _descriptor_record_count(snapshot):
+        raise ValueError(f"revision sidecar {label} record count mismatch: {described_path}")
+    return cast(dict[str, Any], payload)
 
 
 def _validated_revision_sidecars(
@@ -895,6 +1369,7 @@ def _validated_revision_sidecars(
     new_manifest_paths: list[Path],
     revision_sidecar_paths: list[Path],
     expected_sidecar_sha256: list[str],
+    snapshots: _SnapshotStore,
 ) -> list[dict[str, Any]]:
     if len(revision_sidecar_paths) != len(new_manifest_paths):
         raise ValueError("every new manifest requires exactly one revision sidecar")
@@ -906,6 +1381,7 @@ def _validated_revision_sidecars(
     if len({path.resolve() for path in revision_sidecar_paths}) != len(revision_sidecar_paths):
         raise ValueError("revision sidecar paths must be unique")
     validated: list[dict[str, Any]] = []
+    seen_revision_ids: set[str] = set()
     for sidecar_path, expected_sha256 in zip(revision_sidecar_paths, expected_sidecar_sha256, strict=True):
         sidecar_path = sidecar_path.resolve()
         try:
@@ -914,51 +1390,73 @@ def _validated_revision_sidecars(
             raise ValueError(f"revision sidecar escapes repository root: {sidecar_path}") from error
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
             raise ValueError(f"invalid expected revision sidecar SHA-256: {expected_sha256}")
-        actual_sidecar_sha256 = _digest(sidecar_path)
-        if actual_sidecar_sha256 != expected_sha256:
+        sidecar_snapshot = snapshots.read(sidecar_path)
+        if sidecar_snapshot.sha256 != expected_sha256:
             raise ValueError(f"revision sidecar SHA-256 mismatch: {sidecar_path}")
-        sidecar = _read_json(sidecar_path)
-        if sidecar.get("immutable") is not True:
-            raise ValueError(f"revision sidecar is not immutable: {sidecar_path}")
-        descriptor = sidecar.get("revision") or sidecar.get("output")
-        parent = sidecar.get("parent")
-        if not isinstance(descriptor, dict) or not isinstance(parent, dict):
-            raise ValueError(f"revision sidecar is missing revision/output or parent: {sidecar_path}")
-        required_descriptor_fields = {"path", "sha256", "size_bytes", "record_count"}
-        for label, payload in (("revision/output", descriptor), ("parent", parent)):
-            missing = sorted(required_descriptor_fields - payload.keys())
-            if missing:
-                raise ValueError(f"revision sidecar {label} is missing {', '.join(missing)}: {sidecar_path}")
-        revision_path = (root_dir / str(descriptor["path"])).resolve()
-        try:
-            revision_path.relative_to(root_dir.resolve())
-        except ValueError as error:
-            raise ValueError(f"revision path escapes repository root: {revision_path}") from error
+        sidecar = _json_from_snapshot(sidecar_snapshot)
+        revision_id = str(sidecar.get("revision_id", "")).strip()
+        if sidecar.get("immutable") is not True or not revision_id or sidecar.get("schema_version") != "1.0":
+            raise ValueError(
+                f"revision sidecar is not immutable with supported schema_version 1.0: {sidecar_path}"
+            )
+        if revision_id in seen_revision_ids:
+            raise ValueError(f"duplicate revision_id across sidecars: {revision_id}")
+        seen_revision_ids.add(revision_id)
+        descriptor_keys = [key for key in ("revision", "output") if key in sidecar]
+        if len(descriptor_keys) != 1:
+            raise ValueError("revision sidecar requires exactly one of revision or output")
+        descriptor = cast(dict[str, Any], sidecar[descriptor_keys[0]])
+        revision_path = (root_dir / str(descriptor.get("path", ""))).resolve()
         manifest_path = manifests_by_path.get(revision_path)
         if manifest_path is None:
             raise ValueError(f"revision sidecar does not match a supplied manifest: {sidecar_path}")
-        if descriptor.get("sha256") != _digest(manifest_path):
-            raise ValueError(f"revision manifest SHA-256 mismatch: {manifest_path}")
-        if descriptor["size_bytes"] != manifest_path.stat().st_size:
-            raise ValueError(f"revision manifest size mismatch: {manifest_path}")
-        records = _read_records(manifest_path)
-        if descriptor["record_count"] != len(records):
-            raise ValueError(f"revision manifest record count mismatch: {manifest_path}")
-        parent_path = (root_dir / str(parent.get("path", ""))).resolve()
-        try:
-            parent_path.relative_to(root_dir.resolve())
-        except ValueError as error:
-            raise ValueError(f"revision parent escapes repository root: {parent_path}") from error
-        if not parent_path.is_file() or parent.get("sha256") != _digest(parent_path):
-            raise ValueError(f"revision parent SHA-256 mismatch: {parent_path}")
-        if parent.get("size_bytes") not in (None, parent_path.stat().st_size):
-            raise ValueError(f"revision parent size mismatch: {parent_path}")
+        kind = _checkpoint_kind(manifest_path)
+        if kind is None:
+            raise ValueError("authenticated revision sidecars are only valid for completed checkpoints")
+        source_path = manifest_path.with_name(
+            "source_manifest.jsonl" if kind in ("difficult", "gap") else "source_manifest.json"
+        )
+        rejected_path = manifest_path.with_name("rejected_manifest.jsonl")
+        summary_path = manifest_path.with_name("summary.json")
+        companions = sidecar.get("companions")
+        if not isinstance(companions, dict) or set(companions) != {"rejected", "summary"}:
+            raise ValueError("revision sidecar must authenticate exactly rejected and summary companions")
+        _validate_sidecar_descriptor(
+            label="revision/output",
+            payload=descriptor,
+            expected_path=manifest_path,
+            root_dir=root_dir,
+            snapshots=snapshots,
+        )
+        parent = _validate_sidecar_descriptor(
+            label="parent",
+            payload=sidecar.get("parent"),
+            expected_path=source_path,
+            root_dir=root_dir,
+            snapshots=snapshots,
+        )
+        _validate_sidecar_descriptor(
+            label="rejected companion",
+            payload=companions["rejected"],
+            expected_path=rejected_path,
+            root_dir=root_dir,
+            snapshots=snapshots,
+        )
+        _validate_sidecar_descriptor(
+            label="summary companion",
+            payload=companions["summary"],
+            expected_path=summary_path,
+            root_dir=root_dir,
+            snapshots=snapshots,
+        )
         validated.append({
             "path": str(sidecar_path.relative_to(root_dir)),
-            "sha256": actual_sidecar_sha256,
+            "sha256": sidecar_snapshot.sha256,
+            "revision_id": revision_id,
             "revision_path": str(manifest_path.relative_to(root_dir)),
-            "parent_path": str(parent_path.relative_to(root_dir)),
+            "parent_path": str(source_path.relative_to(root_dir)),
             "parent_sha256": str(parent["sha256"]),
+            "companions_authenticated": ["rejected", "summary"],
         })
     if {Path(item["revision_path"]) for item in validated} != {
         path.relative_to(root_dir) for path in new_manifest_paths
@@ -972,11 +1470,558 @@ def _validate_final_inputs(new_manifest_paths: list[Path], revision: str) -> Non
     required = ["difficult", "financial"] if revision == "v3" else ["difficult", "financial", "gap"]
     if sorted(kind for kind in kinds if kind is not None) != sorted(required) or len(kinds) != len(required):
         raise ValueError(f"final status requires exactly these {revision} checkpoints: {required}")
-    if revision == "v5" and not any(path.parent.name == "v3-financial-r2" for path in new_manifest_paths):
-        raise ValueError("final v5 status requires the corrected v3-financial-r2 checkpoint")
+    if revision == "v5" and not any(
+        path.parent.name in ("v3-financial-r2", "v3-financial-r3") for path in new_manifest_paths
+    ):
+        raise ValueError("final v5 status requires a corrected v3-financial-r2/r3 checkpoint")
 
 
-def build_corpus_partition(
+def _validate_parent_relationship(
+    corpus_manifest: dict[str, Any], previous_partition: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def documents(payload: dict[str, Any], label: str) -> list[dict[str, Any]]:
+        value = payload.get("documents")
+        if not isinstance(value, list):
+            raise ValueError(f"parent {label} has no documents array")
+        if any(not isinstance(row, dict) for row in value):
+            raise ValueError(f"parent {label} documents must all be objects")
+        return cast(list[dict[str, Any]], value)
+
+    manifest_documents = documents(corpus_manifest, "manifest")
+    partition_documents = documents(previous_partition, "partition")
+    for label, rows in (("manifest", manifest_documents), ("partition", partition_documents)):
+        ids = [str(row.get("id", "")).strip() for row in rows]
+        hashes = [str(row.get("sha256", "")).strip() for row in rows]
+        if any(not value for value in ids) or len(set(ids)) != len(ids):
+            raise ValueError(f"parent {label} contains blank or duplicate document IDs")
+        if any(not value for value in hashes) or len(set(hashes)) != len(hashes):
+            raise ValueError(f"parent {label} contains blank or duplicate SHA-256 values")
+        canonical_urls = [_derived_normalized_url(row) for row in rows]
+        canonical_urls = [url for url in canonical_urls if url]
+        if len(canonical_urls) != len(set(canonical_urls)):
+            raise ValueError(f"parent {label} contains duplicate canonical URLs")
+    title_publishers = [_derived_title_publisher_key(row) for row in manifest_documents]
+    active_keys = [
+        key for row, key in zip(manifest_documents, title_publishers, strict=True) if not _is_layoutlm(row)
+    ]
+    if len(active_keys) != len(set(active_keys)):
+        raise ValueError("parent manifest contains duplicate normalized title and publisher")
+    manifest_by_sha = {str(row["sha256"]): row for row in manifest_documents}
+    for row in partition_documents:
+        parent = manifest_by_sha.get(str(row["sha256"]))
+        if parent is None:
+            raise ValueError(f"parent partition member is absent from parent manifest: {row['id']}")
+        if parent["id"] != row["id"]:
+            raise ValueError(f"parent manifest/partition ID mismatch for SHA-256 {row['sha256']}")
+        mismatched = [key for key, value in parent.items() if row.get(key) != value]
+        if mismatched:
+            raise ValueError(
+                f"parent manifest/partition metadata mismatch for {row['id']}: {sorted(mismatched)}"
+            )
+    return manifest_documents, partition_documents
+
+
+def _expected_parent_splits(
+    parent_manifest_documents: list[dict[str, Any]],
+    previous_partition_documents: list[dict[str, Any]],
+) -> dict[str, tuple[str, Split]]:
+    previous_by_sha = {str(document["sha256"]): document for document in previous_partition_documents}
+    expected: dict[str, tuple[str, Split]] = {}
+    for document in parent_manifest_documents:
+        if _is_layoutlm(document):
+            continue
+        sha256 = str(document["sha256"])
+        previous = previous_by_sha.get(sha256)
+        previous_split = previous.get("split") if previous is not None else None
+        if previous_split in (None, "dev"):
+            split: Split = "train"
+        elif previous_split in SPLITS:
+            split = previous_split
+        else:
+            raise ValueError(f"parent partition has unsupported split for {document['id']}")
+        expected[sha256] = (str(document["id"]), split)
+    return expected
+
+
+def _fixed_parent_output(
+    document: dict[str, Any],
+    *,
+    source_manifest: str,
+    split: Split,
+    previous_split: object,
+) -> dict[str, Any]:
+    output = _enrich(document, source_manifest)
+    if previous_split is None:
+        rationale = "Previously active and therefore exposed/burned; permanently TRAIN."
+    elif previous_split == "dev":
+        rationale = "Previous DEV exposure is permanent; mapped to TRAIN."
+    else:
+        rationale = f"Preserved immutable previous-partition {split} membership."
+    output.update({
+        "split": split,
+        "assignment_origin": "fixed-previous",
+        "assignment_rationale": rationale,
+    })
+    output.setdefault("source_family_id", str(output.get("family_id", "")))
+    return output
+
+
+def _canonical_root_relative_path(path: Path, root_dir: Path, *, label: str) -> str:
+    resolved_root = root_dir.resolve()
+    resolved_path = path.resolve()
+    try:
+        relative = resolved_path.relative_to(resolved_root)
+    except ValueError as error:
+        raise ValueError(f"{label} path escapes repository root: {path}") from error
+    if relative == Path("."):
+        raise ValueError(f"{label} path must name a file below the repository root")
+    return relative.as_posix()
+
+
+def _serialized_json(payload: object) -> bytes:
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _input_commitment_sha256(descriptors: list[dict[str, Any]]) -> str:
+    canonical = json.dumps(descriptors, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _stage_output(path: Path, payload: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(f".{path.name}.{uuid.uuid4().hex}.staged")
+    descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _fsync_directory(path.parent)
+        return staged
+    except BaseException as staging_error:
+        cleanup_failures = _cleanup_publication_paths([staged])
+        if cleanup_failures:
+            raise staging_error from _cleanup_failure_group(cleanup_failures)
+        raise
+
+
+def _cleanup_publication_paths(paths: list[Path]) -> list[Exception]:
+    """Attempt every cleanup and retry paths left behind by transient failures."""
+    failures: list[Exception] = []
+    retry: list[Path] = []
+    for path in paths:
+        try:
+            existed = path.exists()
+        except Exception as error:
+            failures.append(error)
+            existed = True
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as error:
+            failures.append(error)
+            retry.append(path)
+        if existed:
+            try:
+                _fsync_directory(path.parent)
+            except Exception as error:
+                failures.append(error)
+    for path in retry:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as error:
+            failures.append(error)
+        try:
+            _fsync_directory(path.parent)
+        except Exception as error:
+            failures.append(error)
+    return failures
+
+
+def _cleanup_failure_group(failures: list[Exception]) -> ExceptionGroup:
+    details = "; ".join(str(error) for error in failures)
+    return ExceptionGroup(f"publication cleanup failures: {details}", failures)
+
+
+def _publish_bundle(
+    outputs: list[tuple[Path, bytes]],
+    revalidate_inputs: Callable[[], None],
+) -> None:
+    """Stage all bytes, then atomically link payloads and the immutable descriptor last."""
+    staged: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        for path, payload in outputs:
+            staged.append((path, _stage_output(path, payload)))
+        revalidate_inputs()
+        for path, staged_path in staged:
+            os.link(staged_path, path)
+            published.append(path)
+            staged_path.unlink()
+            _fsync_directory(path.parent)
+        revalidate_inputs()
+    except BaseException as publication_error:
+        cleanup_failures = _cleanup_publication_paths([
+            *reversed(published),
+            *(staged_path for _path, staged_path in staged),
+        ])
+        if cleanup_failures:
+            raise publication_error from _cleanup_failure_group(cleanup_failures)
+        raise
+    cleanup_failures = _cleanup_publication_paths([staged_path for _path, staged_path in staged])
+    if cleanup_failures:
+        raise _cleanup_failure_group(cleanup_failures)
+
+
+def _verify_committed_file(
+    *,
+    payload: object,
+    label: str,
+    root_dir: Path,
+    snapshots: _SnapshotStore,
+    expected_role: str | None = None,
+) -> _Snapshot:
+    if not isinstance(payload, dict):
+        raise ValueError(f"descriptor {label} must be an object")
+    required = {"path", "sha256", "size_bytes", "record_count"}
+    missing = sorted(required - payload.keys())
+    if missing:
+        raise ValueError(f"descriptor {label} is missing {', '.join(missing)}")
+    if expected_role is not None and payload.get("role") != expected_role:
+        raise ValueError(f"descriptor {label} has mismatched role")
+    path = (root_dir / str(payload["path"])).resolve()
+    try:
+        path.relative_to(root_dir.resolve())
+    except ValueError as error:
+        raise ValueError(f"descriptor {label} path escapes repository root") from error
+    snapshot = snapshots.read(path)
+    if payload["sha256"] != snapshot.sha256:
+        raise ValueError(f"descriptor {label} SHA-256 mismatch: {path}")
+    if payload["size_bytes"] != snapshot.size_bytes:
+        raise ValueError(f"descriptor {label} size mismatch: {path}")
+    if payload["record_count"] != _descriptor_record_count(snapshot):
+        raise ValueError(f"descriptor {label} record count mismatch: {path}")
+    return snapshot
+
+
+def verify_corpus_partition_descriptor(
+    descriptor_path: Path,
+    *,
+    root_dir: Path,
+    expected_descriptor_sha256: str,
+) -> dict[str, Any]:
+    """Verify a schema-2 immutable corpus output descriptor and every commitment."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_descriptor_sha256):
+        raise ValueError("invalid expected output descriptor SHA-256")
+    expected_descriptor_path = _canonical_root_relative_path(
+        descriptor_path,
+        root_dir,
+        label="output descriptor",
+    )
+    snapshots = _SnapshotStore()
+    primary_error: BaseException | None = None
+    try:
+        descriptor_snapshot = snapshots.read(descriptor_path)
+        if descriptor_snapshot.sha256 != expected_descriptor_sha256:
+            raise ValueError("output descriptor SHA-256 mismatch")
+        descriptor = _json_from_snapshot(descriptor_snapshot)
+        if descriptor.get("schema_version") != "2.0" or descriptor.get("immutable") is not True:
+            raise ValueError("unsupported or mutable corpus output descriptor")
+        status = descriptor.get("status")
+        if status not in ("provisional", "final"):
+            raise ValueError("output descriptor status must be exactly provisional or final")
+        revision_match = re.fullmatch(r"corpus-partition-(v[345])", str(descriptor.get("revision_id", "")))
+        if revision_match is None:
+            raise ValueError("output descriptor revision_id is missing or unsupported")
+        parents = descriptor.get("parents")
+        outputs = descriptor.get("outputs")
+        authenticated_inputs = descriptor.get("authenticated_inputs")
+        if not isinstance(parents, dict) or set(parents) != {"manifest", "partition"}:
+            raise ValueError("output descriptor requires manifest and partition parent commitments")
+        if not isinstance(outputs, dict) or set(outputs) != {"manifest", "partition"}:
+            raise ValueError("output descriptor requires manifest and partition output commitments")
+        if not isinstance(authenticated_inputs, list) or not authenticated_inputs:
+            raise ValueError("output descriptor requires ordered authenticated input commitments")
+        if any(not isinstance(item, dict) for item in authenticated_inputs):
+            raise ValueError("authenticated input descriptors must be objects")
+        input_descriptors = cast(list[dict[str, Any]], authenticated_inputs)
+        if descriptor.get("input_commitment_sha256") != _input_commitment_sha256(input_descriptors):
+            raise ValueError("output descriptor input commitment SHA-256 mismatch")
+
+        manifest_snapshot = _verify_committed_file(
+            payload=outputs["manifest"],
+            label="outputs.manifest",
+            root_dir=root_dir,
+            snapshots=snapshots,
+        )
+        partition_snapshot = _verify_committed_file(
+            payload=outputs["partition"],
+            label="outputs.partition",
+            root_dir=root_dir,
+            snapshots=snapshots,
+        )
+        manifest = _json_from_snapshot(manifest_snapshot)
+        partition = _json_from_snapshot(partition_snapshot)
+        if partition.get("output_descriptor") != expected_descriptor_path:
+            raise ValueError(
+                "partition output_descriptor does not match the canonical verified descriptor path"
+            )
+        if (
+            "output_descriptor" in manifest
+            and manifest["output_descriptor"] != partition["output_descriptor"]
+        ):
+            raise ValueError("manifest/partition embedded output_descriptor paths differ")
+        expected_schema = {"v3": "3.0", "v4": "4.0", "v5": "5.0"}[revision_match.group(1)]
+        if manifest.get("schema_version") != expected_schema:
+            raise ValueError("manifest schema_version does not match descriptor revision_id")
+        shared_fields = (
+            "schema_version",
+            "status",
+            "generated_date",
+            "policy",
+            "parent_manifest",
+            "parent_partition",
+            "inputs",
+            "authenticated_revision_sidecars",
+            "excluded_documents",
+            "ideal_document_targets",
+            "selected_document_targets",
+            "ideal_targets_family_reachable",
+            "new_documents_forced_by_existing_family",
+            "grandfathered_fixed_family_conflicts",
+            "summary",
+            "integrity_checks",
+            "selection",
+            "documents",
+        )
+        missing_shared = [field for field in shared_fields if field not in manifest or field not in partition]
+        if missing_shared:
+            raise ValueError(f"manifest/partition missing required shared fields: {missing_shared}")
+        mismatched_shared = [field for field in shared_fields if manifest[field] != partition[field]]
+        if mismatched_shared:
+            raise ValueError(f"manifest/partition shared fields differ: {mismatched_shared}")
+        if manifest.get("status") != status:
+            raise ValueError("descriptor status does not match manifest and partition")
+        documents = manifest["documents"]
+        if not isinstance(documents, list):
+            raise ValueError("manifest/partition documents must be an array")
+        if status == "final" and len(documents) < 816:
+            raise ValueError(f"post-dedup final corpus is below the 816-document floor: {len(documents)}")
+        if status == "final":
+            manifest_inputs_for_contract = manifest["inputs"]
+            if not isinstance(manifest_inputs_for_contract, list) or any(
+                not isinstance(item, dict) for item in manifest_inputs_for_contract
+            ):
+                raise ValueError("manifest inputs must be an ordered descriptor list")
+            _validate_final_inputs(
+                [root_dir / str(item.get("path", "")) for item in manifest_inputs_for_contract],
+                revision_match.group(1),
+            )
+
+        parent_snapshots: dict[str, _Snapshot] = {}
+        for label, expected_role, embedded_key in (
+            ("manifest", "parent_manifest", "parent_manifest"),
+            ("partition", "parent_partition", "parent_partition"),
+        ):
+            parent_payload = parents[label]
+            if parent_payload != manifest.get(embedded_key):
+                raise ValueError(f"descriptor parent {label} does not equal embedded parent commitment")
+            parent_snapshots[label] = _verify_committed_file(
+                payload=parent_payload,
+                label=f"parents.{label}",
+                root_dir=root_dir,
+                snapshots=snapshots,
+                expected_role=expected_role,
+            )
+
+        manifest_commitment = partition.get("manifest")
+        expected_manifest_commitment = {
+            "path": outputs["manifest"].get("path"),
+            "sha256": manifest_snapshot.sha256,
+            "size_bytes": manifest_snapshot.size_bytes,
+            "record_count": _descriptor_record_count(manifest_snapshot),
+        }
+        if manifest_commitment != expected_manifest_commitment:
+            raise ValueError("partition embedded manifest commitment mismatch")
+
+        manifest_inputs = manifest.get("inputs")
+        sidecars = manifest.get("authenticated_revision_sidecars")
+        if not isinstance(manifest_inputs, list) or any(
+            not isinstance(item, dict) for item in manifest_inputs
+        ):
+            raise ValueError("manifest inputs must be an ordered descriptor list")
+        if not isinstance(sidecars, list) or any(not isinstance(item, dict) for item in sidecars):
+            raise ValueError("manifest authenticated sidecars must be an ordered descriptor list")
+        input_rows = cast(list[dict[str, Any]], manifest_inputs)
+        sidecar_rows = cast(list[dict[str, Any]], sidecars)
+        expected_inputs: list[dict[str, Any]] = []
+        for input_row in input_rows:
+            accepted_path = str(input_row.get("path", ""))
+            expected_inputs.append({
+                "role": "accepted",
+                "path": accepted_path,
+                "sha256": str(input_row.get("sha256", "")),
+                "size_bytes": input_row.get("size_bytes"),
+            })
+            accepted_absolute = (root_dir / accepted_path).resolve()
+            checkpoint = input_row.get("checkpoint_validation")
+            kind = _checkpoint_kind(accepted_absolute)
+            source_path: Path | None = None
+            if kind is not None:
+                if not isinstance(checkpoint, dict):
+                    raise ValueError("checkpoint input lacks embedded companion commitments")
+                accepted_records = _records_from_snapshot(snapshots.read(accepted_absolute))
+                validated_checkpoint = _validate_checkpoint(accepted_absolute, accepted_records, snapshots)
+                if validated_checkpoint is None:
+                    raise ValueError("final input is not an exact supported checkpoint basename")
+                committed_checkpoint = {
+                    key: (str(Path(str(value)).relative_to(root_dir)) if key.endswith("_path") else value)
+                    for key, value in validated_checkpoint.items()
+                }
+                if checkpoint != committed_checkpoint:
+                    raise ValueError("embedded checkpoint validation does not match exact committed contents")
+                source_path = accepted_absolute.with_name(
+                    "source_manifest.jsonl" if kind in ("difficult", "gap") else "source_manifest.json"
+                )
+                companions = (
+                    ("source", source_path),
+                    ("rejected", accepted_absolute.with_name("rejected_manifest.jsonl")),
+                    ("summary", accepted_absolute.with_name("summary.json")),
+                )
+                for role, companion_path in companions:
+                    relative_path = str(companion_path.relative_to(root_dir))
+                    if checkpoint.get(f"{role}_path") != relative_path:
+                        raise ValueError(f"checkpoint {role} path commitment mismatch")
+                    expected_inputs.append({
+                        "role": role,
+                        "path": relative_path,
+                        "sha256": str(checkpoint.get(f"{role}_sha256", "")),
+                    })
+            matching_sidecars = [row for row in sidecar_rows if row.get("revision_path") == accepted_path]
+            if len(matching_sidecars) > 1:
+                raise ValueError("multiple sidecars commit the same accepted input")
+            if matching_sidecars:
+                if kind is None or source_path is None:
+                    raise ValueError("authenticated sidecar is attached to a non-checkpoint input")
+                sidecar_row = matching_sidecars[0]
+                sidecar_relative = str(sidecar_row.get("path", ""))
+                sidecar_path = (root_dir / sidecar_relative).resolve()
+                try:
+                    sidecar_path.relative_to(root_dir.resolve())
+                except ValueError as error:
+                    raise ValueError("authenticated sidecar path escapes repository root") from error
+                sidecar_snapshot = snapshots.read(sidecar_path)
+                if sidecar_row.get("sha256") != sidecar_snapshot.sha256:
+                    raise ValueError("manifest sidecar SHA-256 commitment mismatch")
+                sidecar = _json_from_snapshot(sidecar_snapshot)
+                if (
+                    sidecar.get("schema_version") != "1.0"
+                    or sidecar.get("immutable") is not True
+                    or sidecar.get("revision_id") != sidecar_row.get("revision_id")
+                ):
+                    raise ValueError("authenticated sidecar identity/version mismatch")
+                revision_keys = [key for key in ("revision", "output") if key in sidecar]
+                if len(revision_keys) != 1:
+                    raise ValueError("authenticated sidecar has ambiguous revision/output")
+                _validate_sidecar_descriptor(
+                    label="revision/output",
+                    payload=sidecar[revision_keys[0]],
+                    expected_path=accepted_absolute,
+                    root_dir=root_dir,
+                    snapshots=snapshots,
+                )
+                _validate_sidecar_descriptor(
+                    label="parent",
+                    payload=sidecar.get("parent"),
+                    expected_path=source_path,
+                    root_dir=root_dir,
+                    snapshots=snapshots,
+                )
+                sidecar_companions = sidecar.get("companions")
+                if not isinstance(sidecar_companions, dict) or set(sidecar_companions) != {
+                    "rejected",
+                    "summary",
+                }:
+                    raise ValueError("authenticated sidecar companion set mismatch")
+                _validate_sidecar_descriptor(
+                    label="rejected companion",
+                    payload=sidecar_companions["rejected"],
+                    expected_path=accepted_absolute.with_name("rejected_manifest.jsonl"),
+                    root_dir=root_dir,
+                    snapshots=snapshots,
+                )
+                _validate_sidecar_descriptor(
+                    label="summary companion",
+                    payload=sidecar_companions["summary"],
+                    expected_path=accepted_absolute.with_name("summary.json"),
+                    root_dir=root_dir,
+                    snapshots=snapshots,
+                )
+                expected_sidecar_row = {
+                    "path": sidecar_relative,
+                    "sha256": sidecar_snapshot.sha256,
+                    "revision_id": sidecar["revision_id"],
+                    "revision_path": accepted_path,
+                    "parent_path": str(source_path.relative_to(root_dir)),
+                    "parent_sha256": sidecar["parent"]["sha256"],
+                    "companions_authenticated": ["rejected", "summary"],
+                }
+                if sidecar_row != expected_sidecar_row:
+                    raise ValueError(
+                        "manifest revision-sidecar commitment does not match authenticated sidecar"
+                    )
+                expected_inputs.append({
+                    "role": "sidecar",
+                    "path": sidecar_relative,
+                    "sha256": str(sidecar_row.get("sha256", "")),
+                })
+            elif status == "final":
+                raise ValueError("final checkpoint input lacks an authenticated sidecar")
+        if len(sidecar_rows) != sum(item["role"] == "sidecar" for item in expected_inputs):
+            raise ValueError("manifest contains unmatched authenticated sidecars")
+        if len(input_descriptors) != len(expected_inputs):
+            raise ValueError("authenticated input descriptor count does not match manifest inputs")
+        for index, (actual, expected) in enumerate(zip(input_descriptors, expected_inputs, strict=True)):
+            if any(actual.get(key) != value for key, value in expected.items()):
+                raise ValueError(f"authenticated input identity mismatch at index {index}")
+            _verify_committed_file(
+                payload=actual,
+                label=f"authenticated_inputs[{index}]",
+                root_dir=root_dir,
+                snapshots=snapshots,
+                expected_role=expected["role"],
+            )
+        if status == "final" and [item["role"] for item in expected_inputs] != [
+            role
+            for _input_row in input_rows
+            for role in ("accepted", "source", "rejected", "summary", "sidecar")
+        ]:
+            raise ValueError("final output descriptor has incomplete or unordered authenticated inputs")
+        if status == "final":
+            _validate_output_contract(
+                manifest=manifest,
+                partition=partition,
+                parent_manifest=_json_from_snapshot(parent_snapshots["manifest"]),
+                parent_partition=_json_from_snapshot(parent_snapshots["partition"]),
+                revision=revision_match.group(1),
+            )
+        snapshots.revalidate()
+        return descriptor
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _close_snapshot_store(snapshots, primary_error)
+
+
+def _build_corpus_partition(
     *,
     root_dir: Path,
     corpus_manifest_path: Path,
@@ -985,85 +2030,112 @@ def build_corpus_partition(
     output_manifest_path: Path,
     output_partition_path: Path,
     status: Literal["provisional", "final"],
-    revision_sidecar_paths: list[Path] | None = None,
-    expected_revision_sidecar_sha256: list[str] | None = None,
+    output_descriptor_path: Path | None,
+    revision: Literal["v3", "v4", "v5"] | None,
+    revision_sidecar_paths: list[Path] | None,
+    expected_revision_sidecar_sha256: list[str] | None,
+    snapshots: _SnapshotStore,
 ) -> BuildResult:
     """Build an immutable deterministic corpus revision from metadata only.
 
     This function never opens PDFs or any candidate, bronze, silver, evaluation, or
     element-failure artifact. It consumes corpus/staging manifests exclusively.
     """
-    if output_manifest_path.exists() or output_partition_path.exists():
+    if status not in ("provisional", "final"):
+        raise ValueError("status must be exactly provisional or final")
+    output_paths = [output_manifest_path, output_partition_path]
+    if output_descriptor_path is not None:
+        output_paths.append(output_descriptor_path)
+    if len({path.resolve() for path in output_paths}) != len(output_paths):
+        raise ValueError("manifest, partition, and descriptor outputs must be distinct paths")
+    if any(path.exists() for path in output_paths):
         raise FileExistsError("versioned partition outputs must not already exist")
-    manifest_match = re.fullmatch(r"manifest-(v[345])\.json", output_manifest_path.name)
-    partition_match = re.fullmatch(r"partition-(v[345])\.json", output_partition_path.name)
-    if manifest_match is None or partition_match is None:
-        raise ValueError("output filenames must use an explicitly supported v3, v4, or v5 revision")
-    manifest_revision = manifest_match.group(1)
-    partition_revision = partition_match.group(1)
-    if manifest_revision != partition_revision:
-        raise ValueError("manifest and partition output revisions do not match")
-    revision = manifest_revision
+    if status == "final" and output_descriptor_path is None:
+        raise ValueError("final status requires an immutable output descriptor path")
+    canonical_output_descriptor = (
+        _canonical_root_relative_path(
+            output_descriptor_path,
+            root_dir,
+            label="output descriptor",
+        )
+        if output_descriptor_path is not None
+        else None
+    )
+    inferred = {
+        match.group(1)
+        for path in (output_manifest_path, output_partition_path)
+        if (match := re.search(r"(?:^|[-_.])(v\d+)(?:[-_.]|$)", path.name)) is not None
+    }
+    if revision is None:
+        unsupported = inferred - SALTS.keys()
+        if unsupported:
+            raise ValueError(f"unsupported corpus revision in output filename: {sorted(unsupported)}")
+        if len(inferred) > 1:
+            raise ValueError("output filenames imply conflicting revisions; supply revision explicitly")
+        revision = cast(Literal["v3", "v4", "v5"], next(iter(inferred), "v3"))
     salt = SALTS[revision]
     if status == "final":
         _validate_final_inputs(new_manifest_paths, revision)
     sidecar_paths = revision_sidecar_paths or []
     expected_sidecar_hashes = expected_revision_sidecar_sha256 or []
+    if status == "final" and (not sidecar_paths or not expected_sidecar_hashes):
+        raise ValueError(
+            "final status requires one externally SHA-pinned immutable revision sidecar per checkpoint"
+        )
     revision_inputs = (
         _validated_revision_sidecars(
             root_dir=root_dir,
             new_manifest_paths=new_manifest_paths,
             revision_sidecar_paths=sidecar_paths,
             expected_sidecar_sha256=expected_sidecar_hashes,
+            snapshots=snapshots,
         )
         if sidecar_paths or expected_sidecar_hashes
         else []
     )
-    corpus_manifest = _read_json(corpus_manifest_path)
-    previous_partition = _read_json(previous_partition_path)
-    previous_sha = _digest(previous_partition_path)
-    previous_by_sha = {
-        str(document["sha256"]): document
-        for document in cast(list[dict[str, Any]], previous_partition["documents"])
-    }
+    corpus_snapshot = snapshots.read(corpus_manifest_path)
+    previous_snapshot = snapshots.read(previous_partition_path)
+    corpus_manifest = _json_from_snapshot(corpus_snapshot)
+    previous_partition = _json_from_snapshot(previous_snapshot)
+    previous_sha = previous_snapshot.sha256
+    corpus_documents, previous_documents = _validate_parent_relationship(corpus_manifest, previous_partition)
+    previous_by_sha = {str(document["sha256"]): document for document in previous_documents}
+    expected_parent_splits = _expected_parent_splits(corpus_documents, previous_documents)
     fixed: list[dict[str, Any]] = []
     excluded: list[dict[str, str]] = []
-    corpus_documents = cast(list[dict[str, Any]], corpus_manifest.get("documents", []))
     for document in corpus_documents:
         if _is_layoutlm(document):
             excluded.append({"id": str(document["id"]), "reason": "LayoutLM family excluded by policy"})
             continue
-        enriched = _enrich(document, str(corpus_manifest_path.relative_to(root_dir)))
-        old = previous_by_sha.get(str(document["sha256"]))
-        if old is None:
-            split: Split = "train"
-            rationale = "Previously active and therefore exposed/burned; permanently TRAIN."
-        elif old["split"] == "dev":
-            split = "train"
-            rationale = "Previous DEV exposure is permanent; mapped to TRAIN."
-        else:
-            split = cast(Split, old["split"])
-            rationale = f"Preserved immutable previous-partition {split} membership."
-        enriched.update({
-            "split": split,
-            "assignment_origin": "fixed-previous",
-            "assignment_rationale": rationale,
-        })
-        fixed.append(enriched)
+        sha256 = str(document["sha256"])
+        old = previous_by_sha.get(sha256)
+        fixed.append(
+            _fixed_parent_output(
+                document,
+                source_manifest=str(corpus_manifest_path.relative_to(root_dir)),
+                split=expected_parent_splits[sha256][1],
+                previous_split=old.get("split") if old is not None else None,
+            )
+        )
 
     existing_hashes = {str(document["sha256"]) for document in fixed}
-    existing_urls = {_normalized_url(document) for document in fixed} - {""}
+    existing_urls = {_derived_normalized_url(document) for document in fixed} - {""}
     existing_titles = {
-        _normalized(str(document.get("normalized_title") or document.get("title") or ""))
+        (
+            _producer(document),
+            _normalized(str(document.get("normalized_title") or document.get("title") or "")),
+        )
         for document in fixed
-    } - {""}
+    }
+    existing_titles = {key for key in existing_titles if key[1]}
     new_by_hash: dict[str, dict[str, Any]] = {}
     new_by_url: dict[str, dict[str, Any]] = {}
-    new_by_title: dict[str, dict[str, Any]] = {}
+    new_by_title: dict[tuple[str, str], dict[str, Any]] = {}
     source_inputs: list[dict[str, Any]] = []
     for path in new_manifest_paths:
-        records = _read_records(path)
-        checkpoint = _validate_checkpoint(path, records)
+        input_snapshot = snapshots.read(path)
+        records = _records_from_snapshot(input_snapshot)
+        checkpoint = _validate_checkpoint(path, records, snapshots)
         accepted = 0
         for raw_document in records:
             document = _adapt_checkpoint_document(raw_document, path)
@@ -1089,17 +2161,18 @@ def build_corpus_partition(
             normalized_title = _normalized(
                 str(enriched.get("normalized_title") or enriched.get("title") or "")
             )
-            if normalized_title in existing_titles:
+            title_publisher = (_producer(enriched), normalized_title)
+            if title_publisher in existing_titles:
                 raise ValueError(
-                    f"new manifest duplicates existing normalized title and publisher: {normalized_title}"
+                    f"new manifest duplicates existing normalized title and publisher: {title_publisher}"
                 )
-            if normalized_title in new_by_title:
+            if title_publisher in new_by_title:
                 raise ValueError(
-                    f"new manifests contain duplicate normalized title and publisher: {normalized_title}"
+                    f"new manifests contain duplicate normalized title and publisher: {title_publisher}"
                 )
             new_by_hash[sha256] = enriched
             new_by_url[normalized_url] = enriched
-            new_by_title[normalized_title] = enriched
+            new_by_title[title_publisher] = enriched
             accepted += 1
         checkpoint_descriptor: dict[str, Any] | None = None
         if checkpoint is not None:
@@ -1111,12 +2184,15 @@ def build_corpus_partition(
                     checkpoint_descriptor[key] = value
         source_inputs.append({
             "path": str(path.relative_to(root_dir)),
-            "sha256": _digest(path),
-            "size_bytes": path.stat().st_size,
+            "sha256": input_snapshot.sha256,
+            "size_bytes": input_snapshot.size_bytes,
             "accepted_unique_documents": accepted,
             "checkpoint_validation": checkpoint_descriptor,
         })
     new_documents = sorted(new_by_hash.values(), key=lambda document: str(document["sha256"]))
+    retained_count = len(fixed) + len(new_documents)
+    if status == "final" and retained_count < 816:
+        raise ValueError(f"post-dedup final corpus is below the 816-document floor: {retained_count}")
     forced_new, variable_groups = _atomic_groups(fixed, new_documents, revision)
     optimization_fixed = fixed + forced_new
     ideal_targets = document_targets(len(fixed) + len(new_documents))
@@ -1126,7 +2202,7 @@ def build_corpus_partition(
     selected_targets, family_exact = _reachable_targets(fixed_counts, variable_groups, ideal_targets)
     if not family_exact or selected_targets != ideal_targets:
         raise ValueError(
-            f"Hamilton targets are not reachable with atomic families: {selected_targets} != {ideal_targets}"
+            f"half-up/residual targets are not reachable with atomic families: {selected_targets} != {ideal_targets}"
         )
     assignments = _optimize(optimization_fixed, variable_groups, ideal_targets, salt)
     assigned_new: list[dict[str, Any]] = list(forced_new)
@@ -1145,45 +2221,37 @@ def build_corpus_partition(
     documents = sorted(
         fixed + assigned_new, key=lambda document: (SPLITS.index(document["split"]), document["id"])
     )
-    if revision in ("v4", "v5") and len(documents) < 816:
-        raise ValueError(f"post-dedup {revision} corpus is below the 816-document floor: {len(documents)}")
-    checks = _verify(documents, previous_partition, selected_targets)
+    checks = _verify(
+        documents,
+        corpus_manifest,
+        previous_partition,
+        selected_targets,
+        parent_source_manifest=str(corpus_manifest_path.relative_to(root_dir)),
+        strict_document_schema=status == "final",
+    )
     summary = _summary(documents)
-    fixed_family_membership: dict[str, set[str]] = defaultdict(set)
-    for document in fixed:
-        fixed_family_membership[str(document["family_id"])].add(str(document["split"]))
-    grandfathered_conflicts = [
-        {"family_id": family, "fixed_splits": sorted(splits, key=SPLITS.index)}
-        for family, splits in sorted(fixed_family_membership.items())
-        if len(splits) > 1
-    ]
+    forced_count, grandfathered_conflicts = _family_declarations(
+        documents, {str(document["sha256"]) for document in fixed}
+    )
     common = {
         "schema_version": {"v3": "3.0", "v4": "4.0", "v5": "5.0"}[revision],
         "status": status,
         "generated_date": "2026-07-31",
-        "policy": {
-            "ratios": RATIOS,
-            "ratio_basis": "document count after SHA-256 consolidation and LayoutLM-family exclusion",
-            "rounding": (
-                "Hamilton largest remainder over exact 3/5, 1/10, and 3/10 quotas; "
-                "TRAIN, validation, holdout order breaks equal remainders"
-            ),
-            "partition_salt": salt,
-            "assignment_priority": "exact Hamilton document targets; strata balance; page balance; salted tie-break",
-            "family_rule": (
-                "transitive atomic components over SHA-256, canonical URL, normalized title, "
-                "publisher/report series, producer/edition, and template family; new members of an "
-                "existing component inherit its fixed split"
-            ),
-            "holdout_evidence_rule": (
-                "manifest metadata only; no candidate output, bronze, silver, evaluation, element "
-                "failures, validation PDFs, or holdout PDFs inspected"
-            ),
+        "policy": _partition_policy(revision),
+        "parent_manifest": {
+            "role": "parent_manifest",
+            "path": str(corpus_manifest_path.relative_to(root_dir)),
+            "sha256": corpus_snapshot.sha256,
+            "size_bytes": corpus_snapshot.size_bytes,
+            "record_count": len(corpus_documents),
         },
         "parent_partition": {
+            "role": "parent_partition",
             "path": str(previous_partition_path.relative_to(root_dir)),
             "sha256": previous_sha,
-            "unchanged": _digest(previous_partition_path) == previous_sha,
+            "size_bytes": previous_snapshot.size_bytes,
+            "record_count": len(previous_documents),
+            "unchanged": True,
         },
         "inputs": source_inputs,
         "authenticated_revision_sidecars": revision_inputs,
@@ -1191,34 +2259,164 @@ def build_corpus_partition(
         "ideal_document_targets": ideal_targets,
         "selected_document_targets": selected_targets,
         "ideal_targets_family_reachable": family_exact,
-        "new_documents_forced_by_existing_family": len(forced_new),
+        "new_documents_forced_by_existing_family": forced_count,
         "grandfathered_fixed_family_conflicts": grandfathered_conflicts,
         "summary": summary,
         "integrity_checks": checks,
-    }
-    manifest = {
-        **common,
         "selection": {
             "previously_active_documents": len(fixed),
             "new_accuracy_uninspected_documents": len(assigned_new),
             "retained_unique_documents": len(documents),
         },
-        "documents": documents,
     }
+    manifest = {**common, "documents": documents}
+    manifest_bytes = _serialized_json(manifest)
     partition = {
         **common,
-        "manifest": str(output_manifest_path.relative_to(root_dir)),
+        "manifest": {
+            "path": str(output_manifest_path.relative_to(root_dir)),
+            "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "size_bytes": len(manifest_bytes),
+            "record_count": len(documents),
+        },
+        "output_descriptor": canonical_output_descriptor,
         "strata_summary": _strata_summary(documents),
         "documents": documents,
     }
-    output_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    output_partition_path.parent.mkdir(parents=True, exist_ok=True)
-    output_manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    output_partition_path.write_text(json.dumps(partition, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if status == "final":
+        _validate_output_contract(
+            manifest=manifest,
+            partition=partition,
+            parent_manifest=corpus_manifest,
+            parent_partition=previous_partition,
+            revision=revision,
+        )
+    partition_bytes = _serialized_json(partition)
+    outputs = [
+        (output_manifest_path, manifest_bytes),
+        (output_partition_path, partition_bytes),
+    ]
+    if output_descriptor_path is not None:
+        sidecars_by_revision = {
+            str(item["revision_path"]): root_dir / str(item["path"]) for item in revision_inputs
+        }
+        authenticated_inputs: list[dict[str, Any]] = []
+        for input_path in new_manifest_paths:
+            authenticated_inputs.append(
+                _commitment_descriptor(
+                    role="accepted", path=input_path, root_dir=root_dir, snapshots=snapshots
+                )
+            )
+            kind = _checkpoint_kind(input_path)
+            if kind is not None:
+                source_path = input_path.with_name(
+                    "source_manifest.jsonl" if kind in ("difficult", "gap") else "source_manifest.json"
+                )
+                for role, companion_path in (
+                    ("source", source_path),
+                    ("rejected", input_path.with_name("rejected_manifest.jsonl")),
+                    ("summary", input_path.with_name("summary.json")),
+                ):
+                    authenticated_inputs.append(
+                        _commitment_descriptor(
+                            role=role,
+                            path=companion_path,
+                            root_dir=root_dir,
+                            snapshots=snapshots,
+                        )
+                    )
+            relative_input = str(input_path.relative_to(root_dir))
+            sidecar_path = sidecars_by_revision.get(relative_input)
+            if sidecar_path is not None:
+                authenticated_inputs.append(
+                    _commitment_descriptor(
+                        role="sidecar", path=sidecar_path, root_dir=root_dir, snapshots=snapshots
+                    )
+                )
+        if status == "final" and [item["role"] for item in authenticated_inputs] != [
+            role
+            for _input_path in new_manifest_paths
+            for role in ("accepted", "source", "rejected", "summary", "sidecar")
+        ]:
+            raise ValueError("final output descriptor lacks complete ordered authenticated inputs")
+        descriptor = {
+            "schema_version": "2.0",
+            "revision_id": f"corpus-partition-{revision}",
+            "immutable": True,
+            "status": status,
+            "parents": {
+                "manifest": common["parent_manifest"],
+                "partition": common["parent_partition"],
+            },
+            "input_commitment_sha256": _input_commitment_sha256(authenticated_inputs),
+            "authenticated_inputs": authenticated_inputs,
+            "outputs": {
+                "manifest": {
+                    "path": str(output_manifest_path.relative_to(root_dir)),
+                    "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                    "size_bytes": len(manifest_bytes),
+                    "record_count": len(documents),
+                },
+                "partition": {
+                    "path": str(output_partition_path.relative_to(root_dir)),
+                    "sha256": hashlib.sha256(partition_bytes).hexdigest(),
+                    "size_bytes": len(partition_bytes),
+                    "record_count": len(documents),
+                },
+            },
+        }
+        outputs.append((output_descriptor_path, _serialized_json(descriptor)))
+    if any(path.exists() for path, _payload in outputs):
+        raise FileExistsError("versioned partition outputs must not already exist")
+    _publish_bundle(outputs, snapshots.revalidate)
     return BuildResult(
         manifest_path=output_manifest_path,
         partition_path=output_partition_path,
+        descriptor_path=output_descriptor_path,
         document_counts={split: int(summary[split]["document_count"]) for split in SPLITS},
         page_counts={split: int(summary[split]["page_count"]) for split in SPLITS},
         status=status,
     )
+
+
+def build_corpus_partition(
+    *,
+    root_dir: Path,
+    corpus_manifest_path: Path,
+    previous_partition_path: Path,
+    new_manifest_paths: list[Path],
+    output_manifest_path: Path,
+    output_partition_path: Path,
+    status: Literal["provisional", "final"],
+    output_descriptor_path: Path | None = None,
+    revision: Literal["v3", "v4", "v5"] | None = None,
+    revision_sidecar_paths: list[Path] | None = None,
+    expected_revision_sidecar_sha256: list[str] | None = None,
+) -> BuildResult:
+    """Build an immutable deterministic corpus revision from metadata only.
+
+    This function never opens PDFs or any candidate, bronze, silver, evaluation, or
+    element-failure artifact. It consumes corpus/staging manifests exclusively.
+    """
+    snapshots = _SnapshotStore()
+    primary_error: BaseException | None = None
+    try:
+        return _build_corpus_partition(
+            root_dir=root_dir,
+            corpus_manifest_path=corpus_manifest_path,
+            previous_partition_path=previous_partition_path,
+            new_manifest_paths=new_manifest_paths,
+            output_manifest_path=output_manifest_path,
+            output_partition_path=output_partition_path,
+            status=status,
+            output_descriptor_path=output_descriptor_path,
+            revision=revision,
+            revision_sidecar_paths=revision_sidecar_paths,
+            expected_revision_sidecar_sha256=expected_revision_sidecar_sha256,
+            snapshots=snapshots,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _close_snapshot_store(snapshots, primary_error)

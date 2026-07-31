@@ -33,7 +33,7 @@ from app.pdf2md.bronze import (
     generate_bronze_bundle,
     verify_bronze_bundle,
 )
-from app.pdf2md.corpus_partition import build_corpus_partition
+from app.pdf2md.corpus_partition import build_corpus_partition, verify_corpus_partition_descriptor
 from app.pdf2md.engine import extract_document_with_catalog, render_document
 from app.pdf2md.evaluation import EvaluationReport, evaluate_document, evaluate_reference_churn
 from app.pdf2md.pymupdf_tables import extract_document_table_elements
@@ -76,15 +76,24 @@ def cli() -> None:
     "--revision-sidecar",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     multiple=True,
-    help="Immutable revision sidecar for each new manifest, in matching order.",
+    help=(
+        "Immutable checkpoint revision sidecar for each new manifest, in matching order; "
+        "required for final builds."
+    ),
 )
 @click.option(
     "--expected-revision-sidecar-sha256",
     multiple=True,
-    help="Externally trusted SHA-256 for each revision sidecar, in matching order.",
+    help="Externally trusted SHA-256 for each immutable checkpoint sidecar, in matching order.",
 )
 @click.option("--output-manifest", type=click.Path(path_type=Path), required=True)
 @click.option("--output-partition", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--output-descriptor",
+    type=click.Path(path_type=Path),
+    help="Immutable commit descriptor, published last; required for final builds.",
+)
+@click.option("--revision", type=click.Choice(("v3", "v4", "v5")))
 @click.option("--status", type=click.Choice(("provisional", "final")), required=True)
 def build_corpus_partition_command(
     root_dir: Path,
@@ -95,9 +104,22 @@ def build_corpus_partition_command(
     expected_revision_sidecar_sha256: tuple[str, ...],
     output_manifest: Path,
     output_partition: Path,
+    output_descriptor: Path | None,
+    revision: str | None,
     status: str,
 ) -> None:
     """Build an immutable, family-safe corpus partition from metadata manifests."""
+    authenticate_inputs = bool(revision_sidecar or expected_revision_sidecar_sha256) or status == "final"
+    if status == "final" and output_descriptor is None:
+        raise click.ClickException("final status requires an immutable output descriptor")
+    if status == "final" and not revision_sidecar:
+        raise click.ClickException(
+            "final status requires externally SHA-pinned immutable checkpoint sidecars"
+        )
+    if authenticate_inputs and len(revision_sidecar) != len(new_manifest):
+        raise click.ClickException("every new manifest requires exactly one revision sidecar")
+    if authenticate_inputs and len(expected_revision_sidecar_sha256) != len(revision_sidecar):
+        raise click.ClickException("every revision sidecar requires an externally supplied SHA-256")
     try:
         result = build_corpus_partition(
             root_dir=root_dir.resolve(),
@@ -106,6 +128,8 @@ def build_corpus_partition_command(
             new_manifest_paths=[path.resolve() for path in new_manifest],
             output_manifest_path=output_manifest.resolve(),
             output_partition_path=output_partition.resolve(),
+            output_descriptor_path=(output_descriptor.resolve() if output_descriptor is not None else None),
+            revision=(cast(Literal["v3", "v4", "v5"], revision) if revision is not None else None),
             status=cast(Literal["provisional", "final"], status),
             revision_sidecar_paths=[path.resolve() for path in revision_sidecar],
             expected_revision_sidecar_sha256=list(expected_revision_sidecar_sha256),
@@ -114,6 +138,36 @@ def build_corpus_partition_command(
         raise click.ClickException(str(error)) from error
     counts = ", ".join(f"{split}={count}" for split, count in result.document_counts.items())
     click.echo(f"wrote {result.status} partition: {counts}")
+
+
+@cli.command("verify-corpus-partition")
+@click.argument("descriptor_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--expected-descriptor-sha256",
+    required=True,
+    help="Externally trusted SHA-256 of the immutable output descriptor.",
+)
+@click.option(
+    "--root-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path("."),
+    show_default=True,
+)
+def verify_corpus_partition_command(
+    descriptor_path: Path,
+    expected_descriptor_sha256: str,
+    root_dir: Path,
+) -> None:
+    """Verify a corpus descriptor, its parents, inputs, and outputs."""
+    try:
+        descriptor = verify_corpus_partition_descriptor(
+            descriptor_path.resolve(),
+            root_dir=root_dir.resolve(),
+            expected_descriptor_sha256=expected_descriptor_sha256,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(f"verified corpus partition {descriptor['revision_id']}")
 
 
 @cli.command("bronze")
