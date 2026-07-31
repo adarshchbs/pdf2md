@@ -71,6 +71,23 @@ uv run --project benchmarks/downloads/ParseBench parse-bench evaluation run \
 
 Use the identical inference/evaluation commands with `pymupdf_text` and `pypdf_baseline` for the native-text baselines. Docling was run on `parsebench-test` with `max_concurrent=1` and a 600-second per-file timeout.
 
+## Born-digital diagnostic slice
+
+The tracked `score_digital_pdf_slice.py` script filters retained per-example results without rerunning inference. Selection uses only source-PDF internals and upstream task tags; it never reads expected Markdown or evaluator rules. The reproduced command is:
+
+```bash
+uv run --project benchmarks/downloads/ParseBench python \
+  benchmarks/integrations/parsebench/score_digital_pdf_slice.py \
+  benchmarks/downloads/ParseBench \
+  benchmarks/datasets/parsebench-full \
+  benchmarks/runs/parsebench-digital-pdf-2026-07-31-v4 \
+  --candidate pdf2md_local=benchmarks/runs/parsebench-full/pdf2md_local/pdf2md_local \
+  --candidate pymupdf_text=benchmarks/runs/parsebench-full/pymupdf_text/pymupdf_text \
+  --candidate pypdf_baseline=benchmarks/runs/parsebench-full/pypdf_baseline/pypdf_baseline
+```
+
+The script excludes non-PDF inputs, upstream `ocr`/`handwritting` task tags, `GlyphLessFont` OCR layers, and raster-scan-majority documents. It calls the pinned evaluator's aggregate implementation on the exact filtered `EvaluationResult` objects, so genuine eligible failures remain in score denominators.
+
 ## Known limitations
 
 - pdf2md rejects non-PDF image inputs rather than silently converting them.

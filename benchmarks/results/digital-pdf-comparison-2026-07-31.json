@@ -1,0 +1,121 @@
+{
+  "result_label": "DIAGNOSTIC_NOT_COMPARABLE",
+  "generated_on": "2026-07-31",
+  "scope": "Reference-independent born-digital PDF slice of the retained full ParseBench run",
+  "curation": "This compact artifact is manually curated from the immutable generated raw summary named under evidence; scores are rounded to four decimal places.",
+  "method": {
+    "dataset_revision": "2805a1d940f95a203e0ae4b88be9934f7765b3fc",
+    "dataset_jsonl_sha256": "4139192f2507c61f02d3169de750bea56af80c921cb78609f19f42cc931f98a4",
+    "evaluator_revision": "1d460294b3b9c57fb3fa944dc17a9c044c24d1e5",
+    "classifier_sha256": "b52a44577cb843706f43ca205f44244e937734cea891ef069c6c1461fc130214",
+    "scorer_sha256": "62e7bc41dccaa975b4ea2d889d64041acfe0e5cc7108074ece3676770c4c65f0",
+    "reference_independent": true,
+    "selection": {
+      "input_must_be_pdf": true,
+      "excluded_task_tags": ["handwritting", "ocr"],
+      "ocr_layer_font_fingerprint": "GlyphLessFont",
+      "min_native_characters_per_page": 20,
+      "scanned_image_coverage": 0.9,
+      "scanned_page_ratio": 0.5
+    },
+    "aggregation": "Pinned ParseBench EvaluationRunner._aggregate_metrics over filtered retained EvaluationResult objects; eligible failures remain in denominators.",
+    "limitations": [
+      "The classifier is conservative diagnostic evidence, not authoritative document ground truth.",
+      "Candidate inference resource envelopes differed and the original pdf2md run used a mutable working tree.",
+      "Only common text-content metrics are suitable for direct comparison with native-text baselines.",
+      "PyMuPDF and PyPDF emit no structured table or layout representation; unsupported cells are null, not measured zero."
+    ]
+  },
+  "slice": {
+    "total_test_ids": 2078,
+    "selected_test_ids": 1879,
+    "excluded_test_ids": 199,
+    "exclusions": {
+      "ocr_or_handwriting_task": 132,
+      "non_pdf_input": 42,
+      "ocr_text_layer": 1,
+      "scanned_raster_majority": 24
+    },
+    "selected_category_test_ids": {
+      "chart": 568,
+      "layout": 451,
+      "table": 499,
+      "text_content": 361,
+      "text_formatting": 346
+    }
+  },
+  "common_text_content_comparison": {
+    "test_ids": 361,
+    "all_candidates_successful": true,
+    "scores": {
+      "pdf2md_local": {
+        "content_faithfulness": 0.7885,
+        "reading_order": 0.6087,
+        "text_correctness": 0.8285,
+        "semantic_formatting": 0.0091
+      },
+      "pymupdf_text": {
+        "content_faithfulness": 0.8729,
+        "reading_order": 0.7673,
+        "text_correctness": 0.8994,
+        "semantic_formatting": 0.0099
+      },
+      "pypdf_baseline": {
+        "content_faithfulness": 0.7913,
+        "reading_order": 0.6589,
+        "text_correctness": 0.8201,
+        "semantic_formatting": 0.0094
+      }
+    }
+  },
+  "pdf2md_supported_structure": {
+    "digital_tables": {
+      "test_ids": 499,
+      "grits_trm_composite": 0.0570,
+      "grits_content": 0.0826,
+      "table_record_match": 0.0225
+    },
+    "digital_layout": {
+      "test_ids": 451,
+      "content_faithfulness": 0.6659,
+      "reading_order": 0.6659,
+      "map_50_95": 0.1367,
+      "localization_pass_rate": 0.4614,
+      "classification_pass_rate": 0.3648,
+      "attribution_pass_rate": 0.0,
+      "element_rule_pass_rate": 0.0163
+    },
+    "semantic_formatting": {
+      "test_ids": 346,
+      "semantic_formatting": 0.0091,
+      "text_styling": 0.0076,
+      "title_accuracy": 0.0008,
+      "title_hierarchy": 0.0,
+      "underline": 0.0,
+      "strikeout": 0.0
+    },
+    "chart_data_points_outside_current_target": {
+      "test_ids": 568,
+      "score": 0.0131
+    }
+  },
+  "pdf2md_outcomes": {
+    "selected_test_ids": 1879,
+    "successful": 1869,
+    "failed": 8,
+    "skipped_no_layout": 2,
+    "failure_types": {
+      "legacy_source_item_id_validation": 4,
+      "unknown_canonical_page_width": 2,
+      "degenerate_drawing_rectangle": 2
+    }
+  },
+  "evidence": {
+    "raw_summary": "benchmarks/runs/parsebench-digital-pdf-2026-07-31-v4/summary.json",
+    "raw_summary_sha256": "d0742673b547a9af1a9793fac1759d5bebc533ee5231b8f730f816dd7183a814",
+    "classifications": "benchmarks/runs/parsebench-digital-pdf-2026-07-31-v4/classifications.jsonl",
+    "pdf2md_report": "benchmarks/runs/parsebench-full/pdf2md_local/pdf2md_local/_evaluation_report.json",
+    "pymupdf_report": "benchmarks/runs/parsebench-full/pymupdf_text/pymupdf_text/_evaluation_report.json",
+    "pypdf_report": "benchmarks/runs/parsebench-full/pypdf_baseline/pypdf_baseline/_evaluation_report.json"
+  }
+}

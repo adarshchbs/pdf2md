@@ -2,7 +2,7 @@
 
 ## Checkpoint state
 
-As of 2026-07-31, the synthetic development harness remains available and pinned public evaluations have been reproduced locally. The full ParseBench snapshot was scored for pdf2md, PyMuPDF native text, and PyPDF native text. The small ParseBench snapshot was additionally scored with pinned Docling and MinerU 2.5 Pro. pdf2md was also scored with the official olmOCR-Bench and RD-TableBench evaluators. See `results/parsebench-2026-07-31.md` and its machine-readable JSON companion for metrics, revisions, failures, latency, limitations, and raw-evidence paths.
+As of 2026-07-31, the synthetic development harness remains available and pinned public evaluations have been reproduced locally. The full ParseBench snapshot was scored for pdf2md, PyMuPDF native text, and PyPDF native text. The small ParseBench snapshot was additionally scored with pinned Docling and MinerU 2.5 Pro. pdf2md was also scored with the official olmOCR-Bench and RD-TableBench evaluators. See `results/parsebench-2026-07-31.md` and its machine-readable JSON companion for the public results. See `results/digital-pdf-comparison-2026-07-31.md` for the reference-independent born-digital diagnostic slice, direct native-text comparison, and prioritized weakness summary.
 
 Generated checkouts, datasets, models, and run artifacts remain ignored. They are evidence, not product fixtures, and must not enter parser rules or tests. The public scores do not turn the synthetic smoke into accuracy evidence and do not promote unrelated integration prototypes to official adapters.
 

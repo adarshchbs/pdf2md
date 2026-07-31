@@ -14,6 +14,8 @@ results/*
 !results/.gitkeep
 !results/parsebench-2026-07-31.md
 !results/parsebench-2026-07-31.json
+!results/digital-pdf-comparison-2026-07-31.md
+!results/digital-pdf-comparison-2026-07-31.json
 
 # Common local outputs if placed below benchmarks.
 *.pdf
