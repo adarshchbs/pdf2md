@@ -2,11 +2,12 @@ from typing import List
 
 import cv2
 import numpy as np
+from numpy.typing import NDArray
+from skimage import morphology
+
 from app.pymupdf_parser.table_parser import cv_operations, find_cell_of_table
 from app.pymupdf_parser.table_parser.create_table_from_cell_bbox import create_table
 from app.pymupdf_parser.table_parser.cv_operations import LineParameters, LineType
-from nptyping import NDArray
-from skimage import morphology
 
 
 def detect_cell_of_table(
@@ -16,12 +17,8 @@ def detect_cell_of_table(
     vertical_lines_acceptable_size,
     horizontal_lines_acceptable_size,
 ):
-    horizontal_lines_3_point_rep = np.array(
-        [line.three_point_representation for line in horizontal_lines]
-    )
-    vertical_lines_3_point_rep = np.array(
-        [line.three_point_representation for line in vertical_lines]
-    )
+    horizontal_lines_3_point_rep = np.array([line.three_point_representation for line in horizontal_lines])
+    vertical_lines_3_point_rep = np.array([line.three_point_representation for line in vertical_lines])
     intersection_points = np.array(
         list(
             find_cell_of_table.intersection_points_between_lines(
@@ -29,13 +26,9 @@ def detect_cell_of_table(
             )
         )
     )
-    intersection_groups = find_cell_of_table.group_point_with_same_x_or_y(
-        intersection_points
-    )
+    intersection_groups = find_cell_of_table.group_point_with_same_x_or_y(intersection_points)
 
-    graph = find_cell_of_table.ConnectedPointGraph(
-        intersection_groups, img_after_cluster
-    )
+    graph = find_cell_of_table.ConnectedPointGraph(intersection_groups, img_after_cluster)
     cell_bboxes = list(graph.get_unique_cell_bbox())
     cell_bboxes = np.array(cell_bboxes, dtype=np.int32)
 
@@ -56,15 +49,10 @@ def detect_cell_of_table(
 
 def adaptive_threshold(img):
     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.adaptiveThreshold(
-        img, 255, cv2.BORDER_REPLICATE, cv2.THRESH_BINARY_INV, 3, 2
-    )
+    thresh = cv2.adaptiveThreshold(img, 255, cv2.BORDER_REPLICATE, cv2.THRESH_BINARY_INV, 3, 2)
 
     thresh: NDArray = (
-        morphology.remove_small_objects(
-            thresh.astype(bool), min_size=10, connectivity=10
-        )
-        * 255
+        morphology.remove_small_objects(thresh.astype(bool), min_size=10, connectivity=10) * 255
     ).astype(np.uint8)
 
     return img, thresh
@@ -105,10 +93,7 @@ def draw_vertical_n_horizontal_lines(
     )
 
     img_vh: np.ndarray = (
-        morphology.remove_small_objects(
-            img_vh.astype(bool), min_size=100, connectivity=100
-        )
-        * 255
+        morphology.remove_small_objects(img_vh.astype(bool), min_size=100, connectivity=100) * 255
     ).astype(np.uint8)
 
     return img_vh

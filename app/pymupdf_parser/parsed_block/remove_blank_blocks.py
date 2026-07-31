@@ -1,11 +1,12 @@
 """Copyright (C) 2022 Adarsh Gupta"""
+
 import logging
 from copy import deepcopy
 
 import numpy as np
-from nptyping import NDArray
+from numpy.typing import NDArray
 
-from app.pymupdf_parser.parameter.pymupdf_content import PyMuPdfContent, _Blocks
+from app.pymupdf_parser.parameter.pymupdf_content import PyMuPdfContent
 from app.pymupdf_parser.utils.iou import intersection_over_first_bbox_area, iou_yaxis
 
 
@@ -25,7 +26,7 @@ def remove_blank_blocks(content: PyMuPdfContent):
             # Inner loop was broken, break the outer.
             break
 
-        if contains_text == True:
+        if contains_text:
             parsed_content.blocks.append(block)
         else:
             if len(parsed_content.blocks) == 0:
@@ -44,8 +45,7 @@ def remove_blank_blocks(content: PyMuPdfContent):
                 current_bbox = np.array(current_span.bbox)
                 iou_y = iou_yaxis(previous_span_bbox, current_bbox)
                 is_current_span_right_after_previous_block = (
-                    current_bbox[0]
-                    >= (previous_span_bbox[0] + previous_span_bbox[2]) / 2
+                    current_bbox[0] >= (previous_span_bbox[0] + previous_span_bbox[2]) / 2
                 )
 
                 if is_current_span_right_after_previous_block and iou_y > 0.8:
@@ -63,10 +63,7 @@ def remove_blank_lines(content: PyMuPdfContent):
         parsed_block = deepcopy(block)
         parsed_block.lines = []
         for line in block.lines:
-
-            contains_text = any(
-                span.text not in {"", " ", "  ", "   "} for span in line.spans
-            )
+            contains_text = any(span.text not in {"", " ", "  ", "   "} for span in line.spans)
 
             if contains_text:
                 parsed_block.lines.append(line)
@@ -86,8 +83,7 @@ def remove_blank_lines(content: PyMuPdfContent):
                 current_bbox = np.array(current_span.bbox)
                 iou_y = iou_yaxis(previous_span_bbox, current_bbox)
                 is_current_span_right_after_previous_block = (
-                    current_bbox[0]
-                    >= (previous_span_bbox[0] + previous_span_bbox[2]) / 2
+                    current_bbox[0] >= (previous_span_bbox[0] + previous_span_bbox[2]) / 2
                 )
 
                 if is_current_span_right_after_previous_block and iou_y > 0.8:
@@ -130,10 +126,7 @@ def remove_tables(
             while i < len(line.spans):
                 span = line.spans[i]
                 for bbox in pred_boxes:
-                    if (
-                        intersection_over_first_bbox_area(np.array(span.bbox), bbox)
-                        > 0.7
-                    ):
+                    if intersection_over_first_bbox_area(np.array(span.bbox), bbox) > 0.7:
                         line.spans.pop(i)
                         logging.info(f" Inside Table : {span.text}")
                         break

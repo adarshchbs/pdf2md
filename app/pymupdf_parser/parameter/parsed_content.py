@@ -1,9 +1,10 @@
 """Copyright (C) 2022 Adarsh Gupta"""
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
-from nptyping import Int, NDArray, Shape
+from numpy.typing import NDArray
 
 
 @dataclass
@@ -27,13 +28,13 @@ class Span:
 @dataclass
 class Header:
     text: str
-    bbox: NDArray[Shape["4"], Int]
+    bbox: NDArray
     tag: Tuple
 
 
 @dataclass
 class Block:
-    block_bbox: NDArray[Shape["4"], Int]
+    block_bbox: NDArray
     spans: List[Span]
     block_text: str
     block_font: int
@@ -47,5 +48,5 @@ class Block:
     page_no: Union[int, float]
     page_width: float = np.nan
     page_height: float = np.nan
-    header: Header = Header("", np.array([]), ())
+    header: Header = field(default_factory=lambda: Header("", np.array([]), ()))
     block_center_align: bool = False

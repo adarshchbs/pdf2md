@@ -1,14 +1,13 @@
+from typing import Union
+
 import numpy as np
 from numba import njit
+
 from app.pymupdf_parser.utils.iou import range_intersection
-from typing import Union
-import pandas as pd
 
 
 @njit
-def moving_avg_cluster_1d(
-    array: np.ndarray, threshold: Union[float, int] = 5
-) -> np.ndarray:
+def moving_avg_cluster_1d(array: np.ndarray, threshold: Union[float, int] = 5) -> np.ndarray:
     """
     It takes an array and a threshold, and returns an array of the same length, where each element is
     the index of the cluster that the corresponding element of the input array belongs to

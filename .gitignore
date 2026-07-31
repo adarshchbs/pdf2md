@@ -130,4 +130,15 @@ dist
 .pnp.*
 
 
+# Python tooling
 *.pyc
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Source PDFs and rendered bronze artifacts may not be redistributable.
+data/corpus/**/*.pdf
+data/bronze/

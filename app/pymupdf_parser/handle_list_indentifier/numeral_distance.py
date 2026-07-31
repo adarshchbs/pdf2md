@@ -1,12 +1,12 @@
 """Copyright (C) 2022 Adarsh Gupta"""
+
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
-import numpy as np
-from nptyping import NDArray
 from numba import njit
+from numpy.typing import NDArray
 
 from app.pymupdf_parser.parameter.parsed_content import Block
 
@@ -51,9 +51,7 @@ def numeral_distance_between_array(x, y):
 
 
 def is_numeral_legit(
-    numeral_with_classes_dict: Dict[
-        Tuple[int, float, int, Tuple], List[NumberedIdWithClasses]
-    ]
+    numeral_with_classes_dict: Dict[Tuple[int, float, int, Tuple], List[NumberedIdWithClasses]],
 ):  # sourcery skip: set-comprehension
     for key in deepcopy(list(numeral_with_classes_dict.keys())):
         numbered_id_with_classes_list = numeral_with_classes_dict[key]
@@ -67,26 +65,18 @@ def is_numeral_legit(
                 similarity_with_other_id = set()
                 for n2 in numbered_id_with_classes_list:
                     similarity_with_other_id.add(
-                        numeral_distance_between_array(
-                            n1.numeral_value, n2.numeral_value
-                        )
+                        numeral_distance_between_array(n1.numeral_value, n2.numeral_value)
                         * (n1.class_separators.strip() == n2.class_separators.strip())
                         * (1 + (n1.numeral_value[-1] in {1, 2, 3}))
                     )
                 # print(n1.numbered_id, n1.numeral_value[-1])
                 similarity_with_other_id = sum(similarity_with_other_id)
                 if similarity_with_other_id < 1:
-                    logging.info(
-                        f"Numeral {n1.numbered_id} has similarity = {similarity_with_other_id}"
-                    )
+                    logging.info(f"Numeral {n1.numbered_id} has similarity = {similarity_with_other_id}")
                     numbered_id_with_classes_list.pop(i)
                 elif key[3] == ("lower_case") and (not n1.class_separators):
-                    logging.info(
-                        f"single lower case character - '{n1.numeral_sign[0]}', so removed"
-                    )
+                    logging.info(f"single lower case character - '{n1.numeral_sign[0]}', so removed")
                     numbered_id_with_classes_list.pop(i)
                 else:
-                    logging.info(
-                        f"Numeral {n1.numbered_id} has similarity = {similarity_with_other_id}"
-                    )
+                    logging.info(f"Numeral {n1.numbered_id} has similarity = {similarity_with_other_id}")
                     i += 1

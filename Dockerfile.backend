@@ -1,18 +1,16 @@
-# Use an official Python runtime as a parent image
-FROM python:3.9-slim
+FROM ghcr.io/astral-sh/uv:0.11.16 AS uv
+FROM python:3.13-slim
 
-RUN apt-get update && apt-get install ffmpeg libsm6 libxext6  -y
-# Set the working directory in the container
+COPY --from=uv /uv /uvx /bin/
+
 WORKDIR /src
+ENV PATH="/src/.venv/bin:$PATH" \
+    UV_LINK_MODE=copy
 
-# Copy the backend source code
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
 COPY app/ /src/app
 
-# Install any needed packages specified in requirements.txt
-RUN pip install  -r /src/app/requirements.txt
-
-# Make port 8000 available to the world outside this container
 EXPOSE 8000
-
-# Define the command to run the app
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

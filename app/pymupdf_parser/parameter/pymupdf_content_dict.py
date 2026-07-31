@@ -1,6 +1,7 @@
 """Copyright (C) 2022 Adarsh Gupta"""
-from dataclasses import dataclass
-from typing import Tuple, OrderedDict
+
+from dataclasses import dataclass, field
+from typing import OrderedDict, Tuple
 
 import numpy as np
 
@@ -22,7 +23,7 @@ class _BlocksDict:
     lines: OrderedDict[int, _LinesDict]
     number: int
     type: int
-    header: Header = Header("", np.array([]), ())
+    header: Header = field(default_factory=lambda: Header("", np.array([]), ()))
 
 
 @dataclass
