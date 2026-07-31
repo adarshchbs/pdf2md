@@ -1,14 +1,31 @@
 import os
-import shutil
+import tempfile
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
+import anyio
+from anyio import CapacityLimiter, to_thread
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.concurrency import run_in_threadpool
 
 from app.pdf2md.engine import extract_document_elements, render_document
 
 router = APIRouter()
+WORK_LIMITER = CapacityLimiter(4)
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+def _make_temp_path() -> Path:
+    descriptor, name = tempfile.mkstemp(suffix=".pdf")
+    os.close(descriptor)
+    return Path(name)
+
+
+def _append_chunk(path: Path, chunk: bytes) -> None:
+    with path.open("ab") as output:
+        output.write(chunk)
+
+
+def _remove_temp_path(path: Path) -> None:
+    path.unlink(missing_ok=True)
 
 
 @router.post("/")
@@ -20,14 +37,13 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict[str, str]:
             detail="File type not supported. Please upload a PDF file.",
         )
 
-    with NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-        shutil.copyfileobj(file.file, temp_file)
-        temp_file_path = Path(temp_file.name)
+    temp_file_path = await to_thread.run_sync(_make_temp_path, limiter=WORK_LIMITER)
     try:
-        elements = await run_in_threadpool(extract_document_elements, temp_file_path)
-        return {
-            "message": f"Successfully uploaded {filename}",
-            "processed_text": render_document(elements),
-        }
+        while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
+            await to_thread.run_sync(_append_chunk, temp_file_path, chunk, limiter=WORK_LIMITER)
+        elements = await to_thread.run_sync(extract_document_elements, temp_file_path, limiter=WORK_LIMITER)
+        rendered = await to_thread.run_sync(render_document, elements, limiter=WORK_LIMITER)
+        return {"message": f"Successfully uploaded {filename}", "processed_text": rendered}
     finally:
-        os.unlink(temp_file_path)
+        with anyio.CancelScope(shield=True):
+            await to_thread.run_sync(_remove_temp_path, temp_file_path, limiter=WORK_LIMITER)

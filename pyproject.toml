@@ -9,7 +9,7 @@ dependencies = [
     "click>=8.4.2",
     "dacite>=1.9.2",
     "duckdb>=1.5.5",
-    "fastapi>=0.141.1",
+    "fastapi==0.141.1",
     "liteparse>=2.10.0",
     "matplotlib>=3.11.1",
     "networkx>=3.6.1",
@@ -49,6 +49,7 @@ packages = ["app"]
 [dependency-groups]
 dev = [
     "basedpyright>=1.39.9",
+    "httpx>=0.28.1",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.0",
@@ -61,7 +62,7 @@ pythonpath = ["."]
 [tool.basedpyright]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
-include = ["app/pdf2md", "app/upload_endpoint.py", "tests"]
+include = ["app/pdf2md", "app/upload_endpoint.py", "app/comparison_router.py", "app/main.py", "tests"]
 exclude = ["**/__pycache__", ".venv", "data"]
 reportMissingTypeStubs = false
 reportAny = false

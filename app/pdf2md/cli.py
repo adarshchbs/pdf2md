@@ -33,6 +33,7 @@ from app.pdf2md.bronze import (
     generate_bronze_bundle,
     verify_bronze_bundle,
 )
+from app.pdf2md.candidate_batch import run_candidate_batch
 from app.pdf2md.corpus_partition import build_corpus_partition, verify_corpus_partition_descriptor
 from app.pdf2md.engine import extract_document_with_catalog, render_document
 from app.pdf2md.evaluation import EvaluationReport, evaluate_document, evaluate_reference_churn
@@ -44,6 +45,27 @@ from app.pdf2md.source_catalog import write_document_with_source_catalog
 @click.group()
 def cli() -> None:
     """Build bronze data and extract structure-aware PDF tables."""
+
+
+@cli.command("run-candidate-batch")
+@click.option(
+    "--root-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=Path("."),
+    show_default=True,
+)
+@click.option("--output-root", type=click.Path(path_type=Path), required=True)
+@click.option("--workers", type=click.IntRange(min=1), default=8, show_default=True)
+@click.option("--no-resume", is_flag=True)
+def run_candidate_batch_command(root_dir: Path, output_root: Path, workers: int, no_resume: bool) -> None:
+    """Extract every corpus-v8 PDF with process-isolated workers."""
+    try:
+        result = run_candidate_batch(
+            root_dir.resolve(), output_root.resolve(), workers=workers, resume=not no_resume
+        )
+    except (FileExistsError, FileNotFoundError, ValueError) as error:
+        raise click.ClickException(str(error)) from error
+    click.echo(json.dumps(result, sort_keys=True))
 
 
 @cli.command("build-corpus-partition")

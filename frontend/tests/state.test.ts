@@ -1,0 +1,4 @@
+import {describe,it,expect} from 'vitest';
+import {bboxToCss} from '../src/lib/api';
+import {readPaneState,togglePane,writePaneState} from '../src/lib/paneState';
+describe('comparison invariants',()=>{it('keeps PDF bbox lower-left transform inside page',()=>{expect(bboxToCss([10,20,110,220],612,792)).toEqual({left:10/612*100,bottom:20/792*100,width:100/612*100,height:200/792*100});expect(bboxToCss([2,4,1,9],612,792)).toBeNull()});it('persists pane collapse state',()=>{const s=new Map<string,string>();const storage={getItem:(k:string)=>s.get(k)??null,setItem:(k:string,v:string)=>s.set(k,v)} as unknown as Storage;const next=togglePane(readPaneState(storage), 'reference');writePaneState(storage,next);expect(readPaneState(storage).reference).toBe(true);expect(togglePane(next,'reference').reference).toBe(false)})});

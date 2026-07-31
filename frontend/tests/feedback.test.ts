@@ -1,0 +1,4 @@
+import { describe, expect, it } from 'vitest';
+import { serializeFeedback, type FeedbackPacket } from '../src/lib/feedback';
+const packet: FeedbackPacket={pdfPath:'/a.pdf',split:'validation',page:4,bbox:[1,2,3,4],candidate:{id:'p-1',json:{type:'paragraph'},rendered:'Candidate text'},reference:{id:'s-1',json:{type:'paragraph'},rendered:'Reference text'},alignment:'mismatch · text differs',comment:'Check grouping'};
+describe('feedback packet',()=>{it('serializes source, exact JSON, IDs and comment',()=>{const out=serializeFeedback(packet);expect(out).toContain('PDF: /a.pdf');expect(out).toContain('BBox: [1, 2, 3, 4]');expect(out).toContain('Element ID: p-1');expect(out).toContain('"type": "paragraph"');expect(out).toContain('Check grouping')});it('escapes multiline JSON in a markdown code fence',()=>{expect(serializeFeedback({...packet,candidate:{...packet.candidate!,json:{a:1,b:['x']}}})).toContain('"b": [\n    "x"\n  ]')})});

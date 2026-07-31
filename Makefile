@@ -1,7 +1,7 @@
 # Quality gates for pdf2md. `make check` applies safe formatting and import fixes,
 # then verifies lint and strict type checking.
 
-PY_PATHS := app/pdf2md app/upload_endpoint.py tests
+PY_PATHS := app/pdf2md app/upload_endpoint.py app/comparison_router.py app/main.py tests
 
 .PHONY: check fmt lint type test all sync lock
 

@@ -86,10 +86,27 @@ uv run pdf2md verify-bronze data/bronze/example
 
 ## API and frontend
 
-The existing FastAPI and Vue application can still be run with:
+The local comparison dashboard runs on port 8010:
 
 ```bash
-docker compose up
+./run.sh
+# open http://127.0.0.1:8010
+```
+
+It uses the current benchmark candidate bundle and `data/silver-cycle2` when those
+root-confined directories exist. These are non-blind candidate/reference artifacts,
+not gold or human review. Override them explicitly when needed:
+
+```bash
+PDF2MD_CANDIDATE_ROOTS=/path/to/candidates \
+PDF2MD_REFERENCE_ROOTS=/path/to/silver \
+./run.sh
+```
+
+Docker mounts `data/` read-only and uses the same defaults:
+
+```bash
+docker compose up backend
 ```
 
 The backend is built from `pyproject.toml` and `uv.lock` using Python 3.13.
