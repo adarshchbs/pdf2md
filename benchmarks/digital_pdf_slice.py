@@ -27,12 +27,15 @@ class PageEvidence:
     native_characters: int
     image_coverage: float
     has_glyphless_font: bool
+    invisible_text_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         if self.native_characters < 0:
             raise ValueError("native character count cannot be negative")
         if not 0 <= self.image_coverage <= 1:
             raise ValueError("image coverage must be in [0, 1]")
+        if not 0 <= self.invisible_text_ratio <= 1:
+            raise ValueError("invisible text ratio must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -86,7 +89,14 @@ def classify_document_evidence(
         and page.image_coverage >= config.scanned_image_coverage
         for page in immutable_pages
     )
-    if any(page.has_glyphless_font for page in immutable_pages):
+    if any(
+        page.has_glyphless_font
+        or (
+            page.invisible_text_ratio >= 0.9
+            and page.image_coverage >= config.scanned_image_coverage
+        )
+        for page in immutable_pages
+    ):
         return DigitalPdfClassification(
             eligible=False,
             reason="ocr_text_layer",
@@ -98,6 +108,14 @@ def classify_document_evidence(
         return DigitalPdfClassification(
             eligible=False,
             reason="scanned_raster_majority",
+            page_count=len(immutable_pages),
+            scanned_page_count=scanned_page_count,
+            pages=immutable_pages,
+        )
+    if sum(page.native_characters for page in immutable_pages) == 0:
+        return DigitalPdfClassification(
+            eligible=False,
+            reason="no_native_text",
             page_count=len(immutable_pages),
             scanned_page_count=scanned_page_count,
             pages=immutable_pages,
@@ -133,8 +151,29 @@ def _page_evidence(page: pymupdf.Page) -> PageEvidence:
         for value in font
         if isinstance(value, str)
     )
+    text = cast(str, page.get_text("text")).strip()
+    visible_characters = 0
+    invisible_characters = 0
+    text_dictionary = cast(dict[str, object], page.get_text("dict"))
+    text_blocks = cast(list[dict[str, object]], text_dictionary["blocks"])
+    for block in text_blocks:
+        lines = cast(list[dict[str, object]], block.get("lines", []))
+        for line in lines:
+            spans = cast(list[dict[str, object]], line.get("spans", []))
+            for span in spans:
+                character_count = len(cast(str, span.get("text", "")).strip())
+                if span.get("alpha", 255) == 0:
+                    invisible_characters += character_count
+                else:
+                    visible_characters += character_count
+    styled_character_count = visible_characters + invisible_characters
     return PageEvidence(
-        native_characters=len(cast(str, page.get_text("text")).strip()),
+        native_characters=len(text),
         image_coverage=min(1.0, covered_area / page_area) if page_area > 0 else 0.0,
         has_glyphless_font=any("glyphlessfont" in value for value in font_fields),
+        invisible_text_ratio=(
+            invisible_characters / styled_character_count
+            if styled_character_count
+            else 0.0
+        ),
     )

@@ -80,13 +80,15 @@ uv run --project benchmarks/downloads/ParseBench python \
   benchmarks/integrations/parsebench/score_digital_pdf_slice.py \
   benchmarks/downloads/ParseBench \
   benchmarks/datasets/parsebench-full \
-  benchmarks/runs/parsebench-digital-pdf-2026-07-31-v4 \
+  benchmarks/runs/parsebench-digital-pdf-2026-07-31-v7 \
   --candidate pdf2md_local=benchmarks/runs/parsebench-full/pdf2md_local/pdf2md_local \
   --candidate pymupdf_text=benchmarks/runs/parsebench-full/pymupdf_text/pymupdf_text \
   --candidate pypdf_baseline=benchmarks/runs/parsebench-full/pypdf_baseline/pypdf_baseline
 ```
 
-The script excludes non-PDF inputs, upstream `ocr`/`handwritting` task tags, `GlyphLessFont` OCR layers, and raster-scan-majority documents. It calls the pinned evaluator's aggregate implementation on the exact filtered `EvaluationResult` objects, so genuine eligible failures remain in score denominators.
+The script excludes non-PDF inputs, upstream `ocr`/`handwritting` task tags, `GlyphLessFont` OCR layers, predominantly invisible text layers corroborated by at least 90% raster coverage on the same page, raster-scan-majority documents, and documents with no native text. It calls the pinned evaluator's aggregate implementation on the exact filtered `EvaluationResult` objects, so genuine eligible failures remain in score denominators.
+
+ParseBench emits only metrics supported by an example's rule set. The generated summary therefore reports `metric_emitting_examples` and `macro_metric_aggregation_counts` for each emitted metric. The latter records genuine-failure zero padding and the resulting denominator for that metric's official `avg_*` macro aggregate. Micro, count-weighted, and synthetic `_predicted` aggregates use different denominator semantics and are not described by this field. Category memberships are not metric denominators: text-content and text-formatting can share a test ID and retain a single per-example result. The summary reports these overlaps explicitly rather than presenting category size as the denominator of every emitted metric.
 
 ## Known limitations
 

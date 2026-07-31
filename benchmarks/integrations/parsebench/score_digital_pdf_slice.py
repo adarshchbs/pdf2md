@@ -22,6 +22,59 @@ class DatasetRecord:
     tags: tuple[str, ...]
 
 
+def metric_example_counts(results: list[Any]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for result in results:
+        if not result.success:
+            continue
+        metric_names = [metric.metric_name for metric in result.metrics]
+        duplicates = [name for name, count in Counter(metric_names).items() if count > 1]
+        if duplicates:
+            raise ValueError(
+                f"{result.test_id} emits duplicate metrics: {', '.join(sorted(duplicates))}"
+            )
+        counts.update(metric_names)
+    return dict(sorted(counts.items()))
+
+
+def macro_metric_aggregation_counts(
+    results: list[Any],
+    failed_by_product: Counter[str],
+    non_score_metrics: set[str] | frozenset[str],
+) -> dict[str, dict[str, int]]:
+    values: dict[str, list[float]] = {}
+    product_types: dict[str, set[str]] = {}
+    count_total_metrics: set[str] = set()
+    for result in results:
+        if not result.success:
+            continue
+        for metric in result.metrics:
+            values.setdefault(metric.metric_name, []).append(metric.value)
+            product_types.setdefault(metric.metric_name, set()).add(result.product_type)
+            if metric.metadata and isinstance(metric.metadata.get("count"), int):
+                count_total_metrics.add(metric.metric_name)
+
+    counts: dict[str, dict[str, int]] = {}
+    for metric_name, metric_values in sorted(values.items()):
+        failure_padding = 0
+        if (
+            metric_name not in count_total_metrics
+            and metric_name not in non_score_metrics
+            and metric_values
+            and all(0.0 <= value <= 1.0 for value in metric_values)
+        ):
+            failure_padding = sum(
+                failed_by_product[product_type]
+                for product_type in product_types[metric_name]
+            )
+        counts[metric_name] = {
+            "emitting_examples": len(metric_values),
+            "failure_padding": failure_padding,
+            "aggregate_denominator": len(metric_values) + failure_padding,
+        }
+    return counts
+
+
 def score_digital_slice(
     evaluator_dir: Path,
     dataset_dir: Path,
@@ -67,6 +120,7 @@ def score_digital_slice(
     sys.path.insert(0, evaluator_src)
     try:
         from parse_bench.evaluation.runner import (  # pyright: ignore[reportMissingImports]
+            _NON_SCORE_METRICS,
             EvaluationRunner,
             _is_infra_failure,
             _is_skipped_result,
@@ -88,6 +142,13 @@ def score_digital_slice(
         skipped = sum(_is_skipped_result(result) for result in results)
         infrastructure_failures = sum(_is_infra_failure(result) for result in results)
         successful = sum(result.success for result in results)
+        failed_by_product = Counter(
+            result.product_type
+            for result in results
+            if not result.success
+            and not _is_skipped_result(result)
+            and not _is_infra_failure(result)
+        )
         return {
             "total": len(results),
             "successful": successful,
@@ -104,6 +165,12 @@ def score_digital_slice(
                 for result in results
                 if not result.success
             ],
+            "metric_emitting_examples": metric_example_counts(results),
+            "macro_metric_aggregation_counts": macro_metric_aggregation_counts(
+                results,
+                failed_by_product,
+                _NON_SCORE_METRICS,
+            ),
             "aggregate_metrics": aggregate,
         }
 
@@ -127,6 +194,16 @@ def score_digital_slice(
         result["source_report"] = str(report_path)
         candidate_results[name] = result
 
+    category_memberships = Counter(
+        category
+        for record in selected_records.values()
+        for category in record.categories
+    )
+    category_overlaps = Counter(
+        " + ".join(record.categories)
+        for record in selected_records.values()
+        if len(record.categories) > 1
+    )
     summary: dict[str, object] = {
         "result_label": "DIAGNOSTIC_NOT_COMPARABLE",
         "method": {
@@ -143,6 +220,14 @@ def score_digital_slice(
             "selected_test_ids": len(selected_ids),
             "excluded_test_ids": len(records) - len(selected_ids),
             "exclusion_counts": dict(sorted(exclusion_counts.items())),
+            "category_memberships": dict(sorted(category_memberships.items())),
+            "overlapping_category_test_ids": sum(category_overlaps.values()),
+            "category_overlap_groups": dict(sorted(category_overlaps.items())),
+            "category_metric_warning": (
+                "Category counts are source memberships, not metric denominators. "
+                "Shared test IDs retain one evaluator result, whose emitted metrics "
+                "are counted separately for every aggregate."
+            ),
         },
         "candidates": candidate_results,
     }
