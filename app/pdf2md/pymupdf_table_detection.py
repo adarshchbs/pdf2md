@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 import pymupdf
 
+from app.pdf2md.pymupdf_runtime import pymupdf_session
 from app.pdf2md.source_catalog import content_addressed_source_item_id, source_item_identity_sha256
 from app.pdf2md.table_provenance import (
     CoordinateFrame,
@@ -18,6 +20,9 @@ from app.pdf2md.table_provenance import (
     NativeRuleId,
     NativeToken,
     NativeTokenId,
+    TableDiagnostic,
+    TableDiagnosticOutcome,
+    TableDiagnosticStage,
     TableProvenance,
 )
 
@@ -159,8 +164,24 @@ class _Coherence:
     populated_row_count: int
 
 
-def detect_page_tables(page: pymupdf.Page, *, document_id: str | None = None) -> list[DetectedTable]:
+def detect_page_tables(
+    page: pymupdf.Page,
+    *,
+    document_id: str | None = None,
+    diagnostics: list[TableDiagnostic] | None = None,
+) -> list[DetectedTable]:
     """Detect tables with authoritative defaults and strongly gated recovery."""
+    with pymupdf_session():
+        return _detect_page_tables(page, document_id=document_id, diagnostics=diagnostics)
+
+
+def _detect_page_tables(
+    page: pymupdf.Page,
+    *,
+    document_id: str | None,
+    diagnostics: list[TableDiagnostic] | None,
+) -> list[DetectedTable]:
+    diagnostic_records: list[TableDiagnostic] = []
     page_width = float(page.rect.width)
     page_height = float(page.rect.height)
     if not math.isfinite(page_width) or not math.isfinite(page_height):
@@ -192,7 +213,43 @@ def detect_page_tables(page: pymupdf.Page, *, document_id: str | None = None) ->
         vertical_strategy="lines_strict",
         horizontal_strategy="lines_strict",
     )
+    diagnostic_records.append(
+        _boundary_diagnostic(
+            TableDiagnosticStage.BOUNDARY_DETECTION,
+            TableDiagnosticOutcome.ACCEPTED,
+            FinderProvenance.DEFAULT.value,
+            input_count=len(defaults),
+            output_count=len(defaults),
+        )
+    )
+    diagnostic_records.append(
+        _boundary_diagnostic(
+            TableDiagnosticStage.BOUNDARY_DETECTION,
+            TableDiagnosticOutcome.REJECTED if strict else TableDiagnosticOutcome.UNCHANGED,
+            "unused_lines_strict_candidates" if strict else "no_lines_strict_candidates",
+            input_count=len(strict),
+            output_count=0,
+        )
+    )
     authoritative = _deduplicate(defaults, page_width, page_height)
+    diagnostic_records.append(
+        _boundary_diagnostic(
+            TableDiagnosticStage.BOUNDARY_DEDUPLICATION,
+            (
+                TableDiagnosticOutcome.REJECTED
+                if len(authoritative) < len(defaults)
+                else TableDiagnosticOutcome.UNCHANGED
+            ),
+            (
+                "default_duplicate_boundary"
+                if len(authoritative) < len(defaults)
+                else "no_default_duplicate_boundary"
+            ),
+            input_count=len(defaults),
+            output_count=len(authoritative),
+        )
+    )
+    before_banner = authoritative
     authoritative = [
         _detach_external_leading_sentence_banner(
             candidate,
@@ -204,6 +261,20 @@ def detect_page_tables(page: pymupdf.Page, *, document_id: str | None = None) ->
         )
         for candidate in authoritative
     ]
+    detached_banner_count = sum(
+        before.bbox != after.bbox for before, after in zip(before_banner, authoritative, strict=True)
+    )
+    diagnostic_records.append(
+        _boundary_diagnostic(
+            TableDiagnosticStage.BOUNDARY_FILTER,
+            (TableDiagnosticOutcome.APPLIED if detached_banner_count else TableDiagnosticOutcome.UNCHANGED),
+            "external_sentence_banner_detached" if detached_banner_count else "no_banner_suppression",
+            input_count=len(before_banner),
+            output_count=len(authoritative),
+            affected_count=detached_banner_count,
+        )
+    )
+    before_strip_count = len(authoritative)
     authoritative = _suppress_rule_connected_external_strips(
         authoritative,
         captions,
@@ -211,6 +282,23 @@ def detect_page_tables(page: pymupdf.Page, *, document_id: str | None = None) ->
         vertical_rules,
         page_width,
         page_height,
+    )
+    diagnostic_records.append(
+        _boundary_diagnostic(
+            TableDiagnosticStage.BOUNDARY_FILTER,
+            (
+                TableDiagnosticOutcome.REJECTED
+                if len(authoritative) < before_strip_count
+                else TableDiagnosticOutcome.UNCHANGED
+            ),
+            (
+                "rule_connected_external_strip"
+                if len(authoritative) < before_strip_count
+                else "no_external_strip_suppression"
+            ),
+            input_count=before_strip_count,
+            output_count=len(authoritative),
+        )
     )
     recovery: list[_Candidate] = []
     ordinal = len(defaults) + len(strict)
@@ -246,9 +334,47 @@ def detect_page_tables(page: pymupdf.Page, *, document_id: str | None = None) ->
             horizontal_strategy="lines_strict",
         )
         ordinal += len(mixed)
-        recovery.extend(_consensus_recovery(text, mixed, band.bbox))
+        consensus = _consensus_recovery(text, mixed, band.bbox)
+        recovery_input_count = len(text) + len(mixed)
+        diagnostic_records.append(
+            _boundary_diagnostic(
+                TableDiagnosticStage.BOUNDARY_FILTER,
+                (
+                    TableDiagnosticOutcome.REJECTED
+                    if len(consensus) * 2 < recovery_input_count
+                    else TableDiagnosticOutcome.ACCEPTED
+                ),
+                (
+                    "recovery_consensus_failed"
+                    if not consensus and recovery_input_count
+                    else "recovery_consensus_discarded_candidates"
+                    if len(consensus) * 2 < recovery_input_count
+                    else "recovery_consensus_accepted"
+                ),
+                input_count=recovery_input_count,
+                output_count=len(consensus),
+            )
+        )
+        recovery.extend(consensus)
 
     accepted_recovery = _filter_candidates(recovery, captions, drawings, page_width, page_height)
+    filter_reasons = Counter(
+        reason
+        for candidate in recovery
+        if (reason := _candidate_filter_reason(candidate, captions, drawings, page_width, page_height))
+        is not None
+    )
+    for reason, rejected_count in sorted(filter_reasons.items()):
+        diagnostic_records.append(
+            _boundary_diagnostic(
+                TableDiagnosticStage.BOUNDARY_FILTER,
+                TableDiagnosticOutcome.REJECTED,
+                reason,
+                input_count=len(recovery),
+                output_count=len(accepted_recovery),
+                affected_count=rejected_count,
+            )
+        )
     additive_recovery = [
         candidate
         for candidate in accepted_recovery
@@ -257,16 +383,47 @@ def detect_page_tables(page: pymupdf.Page, *, document_id: str | None = None) ->
             for default in authoritative
         )
     ]
-    detected = _deduplicate(
-        [*authoritative, *additive_recovery],
-        page_width,
-        page_height,
+    diagnostic_records.append(
+        _boundary_diagnostic(
+            TableDiagnosticStage.BOUNDARY_FILTER,
+            (
+                TableDiagnosticOutcome.REJECTED
+                if len(additive_recovery) < len(accepted_recovery)
+                else TableDiagnosticOutcome.UNCHANGED
+            ),
+            (
+                "overlaps_authoritative_boundary"
+                if len(additive_recovery) < len(accepted_recovery)
+                else "no_authoritative_overlap"
+            ),
+            input_count=len(accepted_recovery),
+            output_count=len(additive_recovery),
+        )
+    )
+    pre_final_dedup = [*authoritative, *additive_recovery]
+    detected = _deduplicate(pre_final_dedup, page_width, page_height)
+    diagnostic_records.append(
+        _boundary_diagnostic(
+            TableDiagnosticStage.BOUNDARY_DEDUPLICATION,
+            (
+                TableDiagnosticOutcome.REJECTED
+                if len(detected) < len(pre_final_dedup)
+                else TableDiagnosticOutcome.UNCHANGED
+            ),
+            (
+                "combined_duplicate_boundary"
+                if len(detected) < len(pre_final_dedup)
+                else "no_combined_duplicate_boundary"
+            ),
+            input_count=len(pre_final_dedup),
+            output_count=len(detected),
+        )
     )
     weak_defaults = [
         candidate for candidate in authoritative if _candidate_coherence(candidate.table) is None
     ]
     if not detected or weak_defaults:
-        borderless = _find_candidates(
+        borderless_found = _find_candidates(
             page,
             finder_provenance=FinderProvenance.BORDERLESS_TEXT,
             priority=3,
@@ -276,10 +433,48 @@ def detect_page_tables(page: pymupdf.Page, *, document_id: str | None = None) ->
             vertical_strategy="text",
             horizontal_strategy="text",
         )
-        borderless = [candidate for candidate in borderless if _is_likely_borderless_table(candidate.table)]
+        borderless = [
+            candidate for candidate in borderless_found if _is_likely_borderless_table(candidate.table)
+        ]
+        diagnostic_records.append(
+            _boundary_diagnostic(
+                TableDiagnosticStage.BOUNDARY_FILTER,
+                (
+                    TableDiagnosticOutcome.REJECTED
+                    if len(borderless) < len(borderless_found)
+                    else TableDiagnosticOutcome.ACCEPTED
+                ),
+                (
+                    "borderless_likelihood_failed"
+                    if len(borderless) < len(borderless_found)
+                    else "borderless_likelihood_accepted"
+                ),
+                input_count=len(borderless_found),
+                output_count=len(borderless),
+            )
+        )
         if not detected:
+            before_borderless_dedup = len(borderless)
             detected = _deduplicate(borderless, page_width, page_height)
+            diagnostic_records.append(
+                _boundary_diagnostic(
+                    TableDiagnosticStage.BOUNDARY_DEDUPLICATION,
+                    (
+                        TableDiagnosticOutcome.REJECTED
+                        if len(detected) < before_borderless_dedup
+                        else TableDiagnosticOutcome.UNCHANGED
+                    ),
+                    (
+                        "borderless_duplicate_boundary"
+                        if len(detected) < before_borderless_dedup
+                        else "no_borderless_duplicate_boundary"
+                    ),
+                    input_count=before_borderless_dedup,
+                    output_count=len(detected),
+                )
+            )
         else:
+            before_reconciliation = detected
             detected = _reconcile_weak_defaults(
                 detected,
                 weak_defaults,
@@ -287,7 +482,87 @@ def detect_page_tables(page: pymupdf.Page, *, document_id: str | None = None) ->
                 page_width,
                 page_height,
             )
-    return [candidate.table for candidate in detected]
+            replacement_count = sum(
+                before.table is not after.table
+                for before, after in zip(before_reconciliation, detected, strict=False)
+            )
+            diagnostic_records.append(
+                _boundary_diagnostic(
+                    TableDiagnosticStage.BOUNDARY_FILTER,
+                    (
+                        TableDiagnosticOutcome.APPLIED
+                        if replacement_count
+                        else TableDiagnosticOutcome.REJECTED
+                        if borderless
+                        else TableDiagnosticOutcome.UNCHANGED
+                    ),
+                    (
+                        "weak_default_replaced"
+                        if replacement_count
+                        else "existing_table_retained"
+                        if borderless
+                        else "no_borderless_replacement"
+                    ),
+                    input_count=len(borderless),
+                    output_count=replacement_count,
+                    affected_count=replacement_count,
+                )
+            )
+    retained_records = tuple(sorted(diagnostic_records, key=_diagnostic_sort_key))
+    result: list[DetectedTable] = []
+    for candidate in detected:
+        snapshot = cast(_TableSnapshot, candidate.table)
+        provenance = replace(snapshot.provenance, diagnostics=retained_records)
+        result.append(replace(snapshot, provenance=provenance))
+    if diagnostics is not None:
+        diagnostics.extend(retained_records)
+    return result
+
+
+def _boundary_diagnostic(
+    stage: TableDiagnosticStage,
+    outcome: TableDiagnosticOutcome,
+    reason: str,
+    *,
+    input_count: int,
+    output_count: int,
+    affected_count: int | None = None,
+) -> TableDiagnostic:
+    metrics = {
+        "input_count": input_count,
+        "output_count": output_count,
+    }
+    if affected_count is not None:
+        metrics["affected_count"] = affected_count
+    return TableDiagnostic(
+        stage=stage,
+        outcome=outcome,
+        reason=reason,
+        metrics=tuple(sorted(metrics.items())),
+    )
+
+
+def _diagnostic_scalar_sort_key(value: bool | int | float | str) -> tuple[int, str]:
+    if type(value) is bool:
+        return 0, "1" if value else "0"
+    if type(value) is int:
+        return 1, str(value)
+    if type(value) is float:
+        return 2, value.hex()
+    if type(value) is str:
+        return 3, value
+    raise AssertionError(f"unsupported diagnostic scalar: {type(value).__name__}")
+
+
+def _diagnostic_sort_key(
+    record: TableDiagnostic,
+) -> tuple[str, str, str, tuple[tuple[str, tuple[int, str]], ...]]:
+    return (
+        record.stage.value,
+        record.outcome.value,
+        record.reason or "",
+        tuple((name, _diagnostic_scalar_sort_key(value)) for name, value in record.metrics),
+    )
 
 
 def _find_candidates(
@@ -537,9 +812,22 @@ def _filter_candidates(
     return [
         candidate
         for candidate in candidates
-        if _associated_caption(candidate.bbox, captions, page_width, page_height) != "figure"
-        and not _is_vector_complex(candidate.bbox, drawings, page_width, page_height)
+        if _candidate_filter_reason(candidate, captions, drawings, page_width, page_height) is None
     ]
+
+
+def _candidate_filter_reason(
+    candidate: _Candidate,
+    captions: Sequence[_Caption],
+    drawings: Sequence[Mapping[str, object]],
+    page_width: float,
+    page_height: float,
+) -> str | None:
+    if _associated_caption(candidate.bbox, captions, page_width, page_height) == "figure":
+        return "figure_caption"
+    if _is_vector_complex(candidate.bbox, drawings, page_width, page_height):
+        return "vector_complexity"
+    return None
 
 
 def _is_strong_recovery_band(
@@ -892,6 +1180,7 @@ def _native_word_tokens(page: pymupdf.Page, *, document_id: str | None = None) -
     duplicate_counts: dict[str, int] = {}
     tokens: list[NativeToken] = []
     for index, (bbox, canonical_bbox, text, _tie_key) in enumerate(records, start=1):
+        duplicate_index = 1
         if document_id is None:
             token_value = f"pymupdf:p{page_number:06d}:word:w{index:06d}"
         else:
@@ -903,13 +1192,14 @@ def _native_word_tokens(page: pymupdf.Page, *, document_id: str | None = None) -
                 text=text,
             )
             duplicate_counts[identity] = duplicate_counts.get(identity, 0) + 1
+            duplicate_index = duplicate_counts[identity]
             token_value = content_addressed_source_item_id(
                 document_id=document_id,
                 page_number=page_number,
                 kind="word",
                 canonical_coordinates=canonical_bbox,
                 text=text,
-                duplicate_index=duplicate_counts[identity],
+                duplicate_index=duplicate_index,
             )
         tokens.append(
             NativeToken(
@@ -919,6 +1209,7 @@ def _native_word_tokens(page: pymupdf.Page, *, document_id: str | None = None) -
                 baseline=bbox[3],
                 text=text,
                 canonical_bbox=canonical_bbox,
+                duplicate_index=duplicate_index,
             )
         )
     return tuple(sorted(tokens, key=lambda token: (token.bbox[1], token.bbox[0], token.token_id.value)))
@@ -949,7 +1240,7 @@ def _native_transformed_vertical_rules(
             elif str(raw_item[0]) == "re":
                 if len(raw_item) < 2:
                     raise ValueError(f"rectangle drawing item is incomplete: {raw_item}")
-                rectangle = _bbox_like(raw_item[1], "drawing rectangle")
+                rectangle = _rectangle_item_bbox(raw_item[1])
                 segments.extend([
                     ((rectangle[0], rectangle[1]), (rectangle[0], rectangle[3])),
                     ((rectangle[2], rectangle[1]), (rectangle[2], rectangle[3])),
@@ -974,7 +1265,7 @@ def _native_transformed_rules(
     stroked_only: bool = False,
 ) -> tuple[NativeRule, ...]:
     matrix = getattr(page, "rotation_matrix", pymupdf.Matrix(1, 0, 0, 1, 0, 0))
-    horizontal: set[tuple[float, float, float, tuple[float, float, float, float]]] = set()
+    horizontal: list[tuple[float, float, float, tuple[float, float, float, float]]] = []
     tolerance = min(float(page.rect.width), float(page.rect.height)) * _HORIZONTAL_TOLERANCE_RATIO
     for drawing in drawings:
         if stroked_only and drawing.get("color") is None:
@@ -993,13 +1284,14 @@ def _native_transformed_rules(
             elif str(raw_item[0]) == "re":
                 if len(raw_item) < 2:
                     raise ValueError(f"rectangle drawing item is incomplete: {raw_item}")
-                rectangle = _bbox_like(raw_item[1], "drawing rectangle")
-                segments.extend([
+                rectangle = _rectangle_item_bbox(raw_item[1])
+                rectangle_edges = (
                     ((rectangle[0], rectangle[1]), (rectangle[2], rectangle[1])),
                     ((rectangle[0], rectangle[3]), (rectangle[2], rectangle[3])),
                     ((rectangle[0], rectangle[1]), (rectangle[0], rectangle[3])),
                     ((rectangle[2], rectangle[1]), (rectangle[2], rectangle[3])),
-                ])
+                )
+                segments.extend(dict.fromkeys(rectangle_edges))
             for start, end in segments:
                 transformed_start = pymupdf.Point(*start) * matrix
                 transformed_end = pymupdf.Point(*end) * matrix
@@ -1013,7 +1305,7 @@ def _native_transformed_rules(
                             max(start[0], end[0]),
                             max(start[1], end[1]),
                         )
-                        horizontal.add((
+                        horizontal.append((
                             x0,
                             x1,
                             (float(transformed_start.y) + float(transformed_end.y)) / 2,
@@ -1024,6 +1316,7 @@ def _native_transformed_rules(
     duplicate_counts: dict[str, int] = {}
     rules: list[NativeRule] = []
     for index, (x0, x1, y, canonical) in enumerate(ordered, start=1):
+        duplicate_index = 1
         if document_id is None:
             rule_value = f"pymupdf:p{page_number:06d}:rule:r{index:06d}"
         else:
@@ -1035,13 +1328,14 @@ def _native_transformed_rules(
                 text=None,
             )
             duplicate_counts[identity] = duplicate_counts.get(identity, 0) + 1
+            duplicate_index = duplicate_counts[identity]
             rule_value = content_addressed_source_item_id(
                 document_id=document_id,
                 page_number=page_number,
                 kind="rule",
                 canonical_coordinates=canonical,
                 text=None,
-                duplicate_index=duplicate_counts[identity],
+                duplicate_index=duplicate_index,
             )
         rules.append(
             NativeRule(
@@ -1051,6 +1345,7 @@ def _native_transformed_rules(
                 x1=x1,
                 y=y,
                 canonical_geometry=canonical,
+                duplicate_index=duplicate_index,
             )
         )
     return tuple(sorted(rules, key=lambda rule: (rule.y, rule.x0, rule.x1, rule.rule_id.value)))
@@ -1147,7 +1442,7 @@ def _horizontal_rules(
             elif kind == "re":
                 if len(raw_item) < 2:
                     raise ValueError(f"rectangle drawing item is incomplete: {raw_item}")
-                rectangle = _bbox_like(raw_item[1], "drawing rectangle")
+                rectangle = _rectangle_item_bbox(raw_item[1])
                 segments.extend([
                     (rectangle[0], rectangle[1], rectangle[2], rectangle[1]),
                     (rectangle[0], rectangle[3], rectangle[2], rectangle[3]),
@@ -1356,6 +1651,24 @@ def _bbox_like(value: object, label: str) -> BBox:
         ],
         label,
     )
+
+
+def _rectangle_item_bbox(value: object) -> BBox:
+    if isinstance(value, Sequence):
+        coordinates = cast(Sequence[object], value)
+        if len(coordinates) != 4:
+            raise ValueError(f"drawing rectangle bbox must have four coordinates: {value}")
+        raw = tuple(float(str(coordinate)) for coordinate in coordinates)
+    else:
+        raw = (
+            float(str(getattr(value, "x0"))),
+            float(str(getattr(value, "y0"))),
+            float(str(getattr(value, "x1"))),
+            float(str(getattr(value, "y1"))),
+        )
+    if not all(math.isfinite(coordinate) for coordinate in raw):
+        raise ValueError(f"drawing rectangle bbox must contain finite coordinates: {raw}")
+    return (min(raw[0], raw[2]), min(raw[1], raw[3]), max(raw[0], raw[2]), max(raw[1], raw[3]))
 
 
 def _point(value: object) -> tuple[float, float]:

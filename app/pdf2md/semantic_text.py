@@ -9,7 +9,15 @@ from itertools import combinations
 from statistics import median
 from typing import Literal, TypeAlias
 
-from app.pdf2md.schema import DocumentElement, ElementStructure
+from app.pdf2md.region_reading_order import ReadingRegion, order_reading_regions
+from app.pdf2md.schema import (
+    DocumentElement,
+    ElementStructure,
+    InlineFootnoteMarkerRange,
+    TextStyleRun,
+    inline_footnote_marker_property,
+    inline_footnote_marker_ranges,
+)
 
 BBox: TypeAlias = tuple[float, float, float, float]
 SemanticKind: TypeAlias = Literal[
@@ -32,6 +40,7 @@ _FOOTNOTE_PREFIX_RE = re.compile(
     rf"(?P<plain>{_FOOTNOTE_LABEL_PATTERN}))[.)]?)(?:\s+|(?=[A-Za-z]))"
 )
 _UNICODE_REFERENCE_RE = re.compile(r"(?<=[A-Za-z]{3})(?P<label>[⁰¹²³⁴⁵⁶⁷⁸⁹]{1,3})(?=\W|$)")
+_NORMALIZED_PROVENANCE_REFERENCE_RE = re.compile(r"(?<=[A-Za-z]{3})(?P<label>\d{1,3})(?=\W|$)")
 _NUMBERED_HEADING_RE = re.compile(r"^(?:\d+(?:\.\d+)*|[IVXLC]+)[.)]?\s+\S", re.IGNORECASE)
 _LIST_LABEL_RE = re.compile(
     r"^(?P<label>(?:\((?:[A-Za-z]|[ivxlcdm]{2,}|\d{1,3})\)|\d+(?:\.\d+)*[.)]|[A-Za-z][.)]|[•▪◦‣⁃*-]))\s+",
@@ -74,7 +83,11 @@ class TextSpan:
     font_name: str = ""
     is_bold: bool = False
     is_italic: bool = False
+    is_underline: bool = False
+    is_strikeout: bool = False
+    baseline_y: float | None = None
     source_item_ids: tuple[str, ...] = ()
+    normalized_footnote_markers: tuple[tuple[int, int, str], ...] = ()
 
     def __post_init__(self) -> None:
         _validate_bbox(self.bbox)
@@ -82,10 +95,21 @@ class TextSpan:
             raise TypeError("font_size must be numeric and not boolean")
         if not math.isfinite(self.font_size) or self.font_size <= 0:
             raise ValueError("font_size must be positive and finite")
+        if self.baseline_y is not None and not math.isfinite(self.baseline_y):
+            raise ValueError("text span baseline_y must be finite")
         if any(not source_item_id for source_item_id in self.source_item_ids):
             raise ValueError("text span source item IDs must not be empty")
         if len(self.source_item_ids) != len(set(self.source_item_ids)):
             raise ValueError("text span source item IDs must be unique")
+        previous_end = 0
+        for start, end, label in self.normalized_footnote_markers:
+            if type(start) is not int or type(end) is not int:
+                raise TypeError("normalized footnote marker offsets must be integers")
+            if start < previous_end or end <= start or end > len(self.text):
+                raise ValueError("normalized footnote marker offsets must be ordered within span text")
+            if not label or self.text[start:end] != label:
+                raise ValueError("normalized footnote marker label must match span text")
+            previous_end = end
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +248,14 @@ class SemanticBlock:
     def page_numbers(self) -> tuple[int, ...]:
         return tuple(dict.fromkeys(block.page_number for block in self.source_blocks))
 
+    @property
+    def style_runs(self) -> tuple[TextStyleRun, ...]:
+        return _semantic_style_runs(
+            self.text,
+            self.source_blocks,
+            list_label=self.list_label if self.paragraph_role == "list_item" else None,
+        )
+
 
 def normalize_page_size(width: float, height: float, rotation: int) -> tuple[float, float]:
     """Return page dimensions in upright coordinates."""
@@ -354,6 +386,142 @@ def join_text_parts(parts: tuple[str, ...]) -> str:
     return re.sub(r"[ \t]+", " ", result).strip()
 
 
+_StyleKey: TypeAlias = tuple[str | None, float, bool, bool, bool, bool]
+
+
+def _span_style(span: TextSpan) -> _StyleKey:
+    return (
+        span.font_name or None,
+        span.font_size,
+        span.is_bold,
+        span.is_italic,
+        span.is_underline,
+        span.is_strikeout,
+    )
+
+
+def _trim_styled(text: str, styles: list[_StyleKey | None]) -> tuple[str, list[_StyleKey | None]]:
+    start = len(text) - len(text.lstrip())
+    end = len(text.rstrip())
+    return text[start:end], styles[start:end]
+
+
+def _styled_line(line: TextLine) -> tuple[str, list[_StyleKey | None]]:
+    text = ""
+    styles: list[_StyleKey | None] = []
+    previous: TextSpan | None = None
+    for span in line.spans:
+        if not span.text:
+            previous = span
+            continue
+        reading_gap = 0.0
+        if previous is not None:
+            _, previous_end = _span_reading_interval(previous, line.direction)
+            current_start, _ = _span_reading_interval(span, line.direction)
+            reading_gap = current_start - previous_end
+        if (
+            text
+            and previous is not None
+            and not text[-1].isspace()
+            and not span.text[0].isspace()
+            and reading_gap >= min(previous.font_size, span.font_size) * 0.15
+        ):
+            text += " "
+            styles.append(None)
+        text += span.text
+        styles.extend([_span_style(span)] * len(span.text))
+        previous = span
+    return _trim_styled(text, styles)
+
+
+def _join_styled_parts(
+    parts: Sequence[tuple[str, list[_StyleKey | None]]],
+) -> tuple[str, list[_StyleKey | None]]:
+    result = ""
+    styles: list[_StyleKey | None] = []
+    for raw_text, raw_styles in parts:
+        part, part_styles = _trim_styled(raw_text, raw_styles)
+        if not part:
+            continue
+        if not result:
+            result, styles = part, list(part_styles)
+        elif result.endswith("­"):
+            result = result[:-1] + part.lstrip()
+            styles = styles[:-1] + part_styles[len(part) - len(part.lstrip()) :]
+        elif result.endswith("-"):
+            stripped = part.lstrip()
+            result += stripped
+            styles.extend(part_styles[len(part) - len(stripped) :])
+        else:
+            result += " " + part
+            styles.append(None)
+            styles.extend(part_styles)
+    # join_text_parts collapses horizontal whitespace after joining.
+    normalized_text = ""
+    normalized_styles: list[_StyleKey | None] = []
+    index = 0
+    while index < len(result):
+        if result[index] in " \t":
+            end = index + 1
+            while end < len(result) and result[end] in " \t":
+                end += 1
+            normalized_text += " "
+            normalized_styles.append(next((style for style in styles[index:end] if style is not None), None))
+            index = end
+        else:
+            normalized_text += result[index]
+            normalized_styles.append(styles[index])
+            index += 1
+    return _trim_styled(normalized_text, normalized_styles)
+
+
+def _styled_block(block: TextBlock) -> tuple[str, list[_StyleKey | None]]:
+    return _join_styled_parts([_styled_line(line) for line in block.lines])
+
+
+def _semantic_style_runs(
+    text: str,
+    blocks: Sequence[TextBlock],
+    *,
+    list_label: str | None,
+) -> tuple[TextStyleRun, ...]:
+    source_text, styles = _join_styled_parts([_styled_block(block) for block in blocks])
+    if list_label is not None:
+        match = _LIST_LABEL_RE.match(source_text)
+        if match is None or match.group("label") != list_label:
+            return ()
+        source_text = source_text[match.end() :]
+        styles = styles[match.end() :]
+        source_text, styles = _trim_styled(source_text, styles)
+    if source_text != text:
+        return ()
+    runs: list[TextStyleRun] = []
+    index = 0
+    while index < len(styles):
+        style = styles[index]
+        if style is None:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(styles) and styles[end] == style:
+            end += 1
+        family, size, bold, italic, underline, strikeout = style
+        runs.append(
+            TextStyleRun(
+                start=index,
+                end=end,
+                font_family=family,
+                font_size=size,
+                bold=bold,
+                italic=italic,
+                underline=underline,
+                strikeout=strikeout,
+            )
+        )
+        index = end
+    return tuple(runs)
+
+
 def infer_page_column_splits(
     blocks: Sequence[TextBlock], *, atomic_bboxes: Sequence[BBox] = ()
 ) -> tuple[float, ...]:
@@ -401,64 +569,65 @@ def reading_order(blocks: tuple[TextBlock, ...] | list[TextBlock]) -> tuple[Text
     return column_aware_reading_order(blocks)
 
 
+def _canonical_page_reading_rotation(blocks: Sequence[TextBlock]) -> int:
+    weights: Counter[int] = Counter()
+    for block in blocks:
+        weights[block.reading_rotation] += max(1, len(block.text.strip()))
+    return min(weights, key=lambda rotation: (-weights[rotation], rotation))
+
+
+def _canonical_region_kind(block: TextBlock, bbox: BBox, page_height: float, body_font_size: float) -> str:
+    if bbox[3] - bbox[1] <= page_height * 0.04:
+        center_y = (bbox[1] + bbox[3]) / 2
+        if center_y <= page_height * 0.12:
+            return "header"
+        if center_y >= page_height * 0.88:
+            return "footer"
+    if is_caption(block):
+        return "caption"
+    if is_heading(block, body_font_size):
+        return "heading"
+    return "body"
+
+
 def _order_page(blocks: list[TextBlock], *, splits: tuple[float, ...] | None = None) -> list[TextBlock]:
     if len(blocks) < 2:
         return blocks.copy()
-    page_width = blocks[0].reading_page_size[0]
-    regular = [block for block in blocks if _bbox_width(block.reading_bbox) < page_width * 0.72]
-    effective_splits = _column_splits(regular, page_width) if splits is None else splits
-    if not effective_splits:
-        return _order_inline_margin_fragments(sorted(blocks, key=_position_key))
-
-    spanning = sorted(
-        (
-            block
-            for block in blocks
-            if block not in regular or _crosses_splits(block.reading_bbox, effective_splits)
-        ),
-        key=_position_key,
+    canonical_rotation = _canonical_page_reading_rotation(blocks)
+    canonical_page_width, canonical_page_height = normalize_page_size(
+        blocks[0].page_width,
+        blocks[0].page_height,
+        canonical_rotation,
     )
-    result: list[TextBlock] = []
-    remaining = [block for block in blocks if block not in spanning]
-    boundary = -math.inf
-    for separator in spanning:
-        separator_bbox = separator.reading_bbox
-        band = [block for block in remaining if boundary <= block.reading_bbox[1] < separator_bbox[1]]
-        result.extend(_order_columns(band, effective_splits))
-        result.append(separator)
-        remaining = [block for block in remaining if block not in band]
-        boundary = separator_bbox[3]
-    result.extend(_order_columns(remaining, effective_splits))
-    return _order_inline_margin_fragments(result)
-
-
-def _inline_margin_region(block: TextBlock) -> Literal["top", "bottom"] | None:
-    bbox = block.reading_bbox
-    if bbox[3] - bbox[1] > block.reading_page_size[1] * 0.04:
-        return None
-    return _margin_region(block, 0.12)
-
-
-def _order_inline_margin_fragments(blocks: list[TextBlock]) -> list[TextBlock]:
-    """Order margin bands top-to-bottom, with same-row fragments left-to-right."""
-    top = _order_margin_rows([block for block in blocks if _inline_margin_region(block) == "top"])
-    middle = [block for block in blocks if _inline_margin_region(block) is None]
-    bottom = _order_margin_rows([block for block in blocks if _inline_margin_region(block) == "bottom"])
-    return [*top, *middle, *bottom]
-
-
-def _order_margin_rows(blocks: list[TextBlock]) -> list[TextBlock]:
-    rows: list[list[TextBlock]] = []
-    for block in sorted(blocks, key=_position_key):
-        if not rows or block.reading_bbox[1] >= max(item.reading_bbox[3] for item in rows[-1]):
-            rows.append([block])
-        else:
-            rows[-1].append(block)
-    return [
-        block
-        for row in rows
-        for block in sorted(row, key=lambda item: (item.reading_bbox[0], item.reading_bbox[1]))
+    canonical_bboxes = [
+        normalize_bbox(block.bbox, block.page_width, block.page_height, canonical_rotation)
+        for block in blocks
     ]
+    body_font_size = infer_body_font_size(blocks)
+    regular = [
+        block
+        for block, bbox in zip(blocks, canonical_bboxes, strict=True)
+        if block.reading_rotation == canonical_rotation and _bbox_width(bbox) < canonical_page_width * 0.72
+    ]
+    effective_splits = _column_splits(regular, canonical_page_width) if splits is None else splits
+    regions = tuple(
+        ReadingRegion(
+            region_id=str(index),
+            bbox=canonical_bboxes[index],
+            kind=_canonical_region_kind(
+                block,
+                canonical_bboxes[index],
+                canonical_page_height,
+                body_font_size,
+            ),
+            native_index=index,
+            page_width=canonical_page_width,
+            page_height=canonical_page_height,
+        )
+        for index, block in enumerate(blocks)
+    )
+    ordered_regions = order_reading_regions(regions, column_splits=effective_splits)
+    return [blocks[int(region.region_id)] for region in ordered_regions]
 
 
 def _column_splits(blocks: list[TextBlock], page_width: float) -> tuple[float, ...]:
@@ -555,23 +724,6 @@ def _bbox_overlap_fraction(first: BBox, second: BBox) -> float:
     if x1 <= x0 or y1 <= y0:
         return 0.0
     return (x1 - x0) * (y1 - y0) / ((_bbox_width(first)) * (first[3] - first[1]))
-
-
-def _crosses_splits(bbox: BBox, splits: tuple[float, ...]) -> bool:
-    return any(bbox[0] < split < bbox[2] for split in splits)
-
-
-def _order_columns(blocks: list[TextBlock], splits: tuple[float, ...]) -> list[TextBlock]:
-    columns: list[list[TextBlock]] = [[] for _ in range(len(splits) + 1)]
-    for block in blocks:
-        column = sum(_center_x(block) >= split for split in splits)
-        columns[column].append(block)
-    return [block for column in columns for block in sorted(column, key=_position_key)]
-
-
-def _position_key(block: TextBlock) -> tuple[float, float]:
-    bbox = block.reading_bbox
-    return bbox[1], bbox[0]
 
 
 def _center_x(block: TextBlock) -> float:
@@ -801,41 +953,82 @@ def join_paragraphs(
     result: list[SemanticBlock] = []
     for group in groups:
         text = join_text_parts(tuple(block.text for block in group))
-        label, depth, content = _list_item_parts(text, group[0])
+        label, content = _list_item_parts(text, group[0])
         result.append(
             SemanticBlock(
                 kind="paragraph",
                 text=content,
                 source_blocks=tuple(group),
                 paragraph_role="list_item" if label is not None else None,
-                list_depth=depth,
+                list_depth=0 if label is not None else None,
                 list_label=label,
             )
         )
-    return tuple(result)
+    return _infer_list_depths(tuple(result))
 
 
-def _list_item_parts(text: str, source: TextBlock) -> tuple[str | None, int | None, str]:
+def _list_item_parts(text: str, source: TextBlock) -> tuple[str | None, str]:
     bbox = source.reading_bbox
     page_height = source.reading_page_size[1]
     match = _LIST_LABEL_RE.match(text)
     if match is None:
-        return None, None, text
+        return None, text
     label = match.group("label")
     in_margin = bbox[3] <= page_height * 0.1 or bbox[1] >= page_height * 0.9
     if in_margin and label[0].isdigit() and label[:-1].count(".") >= 1:
-        return None, None, text
+        return None, text
     content = text[match.end() :].strip()
     if not content or _looks_like_non_list_label(label, content):
-        return None, None, text
-    if label.startswith("("):
-        marker = label[1:-1]
-        depth = 2 if marker.casefold() in {"i", "ii", "iii", "iv", "v", "vi", "vii", "viii"} else 1
-    elif label[0].isdigit() and "." in label[:-1]:
-        depth = label[:-1].count(".")
-    else:
-        depth = 0
-    return label, depth, content
+        return None, text
+    return label, content
+
+
+def _infer_list_depths(semantics: tuple[SemanticBlock, ...]) -> tuple[SemanticBlock, ...]:
+    """Infer nesting only from consecutive same-column indentation geometry."""
+    result: list[SemanticBlock] = []
+    indentation_stack: list[float] = []
+    previous_item: SemanticBlock | None = None
+    for semantic in semantics:
+        if semantic.paragraph_role != "list_item":
+            result.append(semantic)
+            previous_item = None
+            indentation_stack.clear()
+            continue
+        block = semantic.source_blocks[0]
+        x0 = block.reading_bbox[0]
+        tolerance = max(block.font_size * 0.75, block.reading_page_size[0] * 0.01)
+        if previous_item is None:
+            indentation_stack = [x0]
+            depth = 0
+        else:
+            previous_block = previous_item.source_blocks[0]
+            same_page = previous_block.page_number == block.page_number
+            same_column = _horizontal_overlap(previous_block.reading_bbox, block.reading_bbox) >= 0.35
+            if not same_page or not same_column:
+                indentation_stack = [x0]
+                depth = 0
+            else:
+                matching = next(
+                    (
+                        index
+                        for index, indentation in enumerate(indentation_stack)
+                        if abs(x0 - indentation) <= tolerance
+                    ),
+                    None,
+                )
+                if matching is not None:
+                    depth = matching
+                    indentation_stack = indentation_stack[: matching + 1]
+                elif x0 > indentation_stack[-1] + tolerance:
+                    indentation_stack.append(x0)
+                    depth = len(indentation_stack) - 1
+                else:
+                    indentation_stack = [x0]
+                    depth = 0
+        updated = replace(semantic, list_depth=depth)
+        result.append(updated)
+        previous_item = updated
+    return tuple(result)
 
 
 def _looks_like_non_list_label(label: str, content: str) -> bool:
@@ -1176,6 +1369,7 @@ def _split_block_at_spans(block: TextBlock, selected_spans: frozenset[int]) -> t
                             max(span.bbox[2] for span in spans),
                             max(span.bbox[3] for span in spans),
                         ),
+                        direction=line.direction,
                     )
                 )
     if not selected_lines or not residual_lines:
@@ -1936,14 +2130,49 @@ def _looks_like_formula_script(marker: _FootnoteMarker) -> bool:
     return not following or re.match(r"[A-Za-z0-9_+−=()[\]{}]", following) is not None
 
 
+def _logical_line_text_and_span_offsets(line: TextLine) -> tuple[str, tuple[int, ...]]:
+    """Assemble normalized line text while retaining each span's logical start."""
+    text = ""
+    starts: list[int] = []
+    previous: TextSpan | None = None
+    for span in line.spans:
+        reading_gap = 0.0
+        if previous is not None:
+            _, previous_end = _span_reading_interval(previous, line.direction)
+            current_start, _ = _span_reading_interval(span, line.direction)
+            reading_gap = current_start - previous_end
+        if (
+            text
+            and previous is not None
+            and not text[-1].isspace()
+            and span.text
+            and not span.text[0].isspace()
+            and reading_gap >= min(previous.font_size, span.font_size) * 0.15
+        ):
+            text += " "
+        starts.append(len(text))
+        text += span.text
+        previous = span
+    leading = len(text) - len(text.lstrip())
+    return text.strip(), tuple(start - leading for start in starts)
+
+
 def _semantic_reference_markers(semantic: SemanticBlock) -> tuple[_FootnoteMarker, ...]:
     markers: list[_FootnoteMarker] = []
     for block in semantic.source_blocks:
         for line in block.lines:
             spans = line.spans
-            for index, span in enumerate(spans):
+            line_text, span_starts = _logical_line_text_and_span_offsets(line)
+            line_markers: list[tuple[int, _FootnoteMarker]] = []
+            eligible_provenance_spans = {
+                match.span("label") for match in _NORMALIZED_PROVENANCE_REFERENCE_RE.finditer(line_text)
+            }
+            for index, (span, span_start) in enumerate(zip(spans, span_starts, strict=True)):
                 stripped = span.text.strip()
-                if re.fullmatch(_FOOTNOTE_LABEL_PATTERN, stripped) is not None:
+                if (
+                    not span.normalized_footnote_markers
+                    and re.fullmatch(_FOOTNOTE_LABEL_PATTERN, stripped) is not None
+                ):
                     previous = next(
                         (candidate for candidate in reversed(spans[:index]) if candidate.text.strip()),
                         None,
@@ -1963,30 +2192,53 @@ def _semantic_reference_markers(semantic: SemanticBlock) -> tuple[_FootnoteMarke
                             key=lambda candidate: _bbox_distance(span.bbox, candidate.bbox),
                         )
                         if _is_superscript_neighbor(span, nearest, line):
-                            markers.append(
+                            start = span_start + len(span.text) - len(span.text.lstrip())
+                            end = start + len(stripped)
+                            line_markers.append((
+                                start,
                                 _FootnoteMarker(
                                     label=_normalize_footnote_label(stripped),
                                     text=stripped,
-                                    previous_text="" if previous is None else previous.text.rstrip(),
-                                    next_text="" if following is None else following.text.lstrip(),
-                                )
-                            )
-                for match in _UNICODE_REFERENCE_RE.finditer(span.text):
-                    markers.append(
+                                    previous_text=line_text[:start],
+                                    next_text=line_text[end:],
+                                ),
+                            ))
+                for local_start, local_end, label in span.normalized_footnote_markers:
+                    start, end = span_start + local_start, span_start + local_end
+                    if (start, end) not in eligible_provenance_spans:
+                        continue
+                    line_markers.append((
+                        start,
                         _FootnoteMarker(
-                            label=_normalize_footnote_label(match.group("label")),
-                            text=match.group("label"),
-                            previous_text=span.text[: match.start()],
-                            next_text=span.text[match.end() :],
-                        )
-                    )
-    return tuple(dict.fromkeys(markers))
+                            label=label,
+                            text=line_text[start:end],
+                            previous_text=line_text[:start],
+                            next_text=line_text[end:],
+                        ),
+                    ))
+            for match in _UNICODE_REFERENCE_RE.finditer(line_text):
+                start, end = match.span("label")
+                line_markers.append((
+                    start,
+                    _FootnoteMarker(
+                        label=_normalize_footnote_label(match.group("label")),
+                        text=match.group("label"),
+                        previous_text=line_text[:start],
+                        next_text=line_text[end:],
+                    ),
+                ))
+            markers.extend(marker for _, marker in sorted(line_markers, key=lambda item: item[0]))
+    return tuple(markers)
 
 
-def _replace_reference_marker(content: str, marker: _FootnoteMarker) -> str:
-    replacement = f"[^{marker.label}]"
-    if marker.text not in content:
-        return content
+def _is_generated_reference_span(content: str, start: int, end: int) -> bool:
+    return start >= 2 and content[start - 2 : start] == "[^" and content[end : end + 1] == "]"
+
+
+def _reference_marker_span(content: str, marker: _FootnoteMarker, *, start_at: int) -> tuple[int, int] | None:
+    """Resolve one source-ordered marker against the unchanged element content."""
+    if content.find(marker.text, start_at) < 0:
+        return None
     before = marker.previous_text[-24:]
     after = marker.next_text[:24]
     pattern = re.compile(
@@ -1994,13 +2246,70 @@ def _replace_reference_marker(content: str, marker: _FootnoteMarker) -> str:
         + f"(?P<marker>{re.escape(marker.text)})"
         + (r"\s*" + re.escape(after) if after else "")
     )
-    match = pattern.search(content)
+    match = pattern.search(content, start_at)
     if match is not None:
-        start, end = match.span("marker")
-        return content[:start] + replacement + content[end:]
-    if content.count(marker.text) == 1:
-        return content.replace(marker.text, replacement)
-    return content
+        span = match.span("marker")
+        if not _is_generated_reference_span(content, *span):
+            return span
+    candidates: list[tuple[int, int]] = []
+    candidate = content.find(marker.text, start_at)
+    while candidate >= 0:
+        span = candidate, candidate + len(marker.text)
+        if not _is_generated_reference_span(content, *span):
+            candidates.append(span)
+        candidate = content.find(marker.text, span[1])
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _reference_marker_spans(
+    content: str, markers: Sequence[_FootnoteMarker]
+) -> tuple[tuple[int, int] | None, ...]:
+    """Allocate repeated marker occurrences once, in source/content order."""
+    result: list[tuple[int, int] | None] = []
+    cursor = 0
+    for marker in markers:
+        span = _reference_marker_span(content, marker, start_at=cursor)
+        result.append(span)
+        if span is not None:
+            cursor = span[1]
+    return tuple(result)
+
+
+def _rebase_generated_marker_ranges(
+    ranges: Sequence[InlineFootnoteMarkerRange],
+    replacements: Sequence[tuple[int, int, str]],
+) -> list[InlineFootnoteMarkerRange]:
+    result: list[InlineFootnoteMarkerRange] = []
+    for marker in ranges:
+        delta = 0
+        for start, end, replacement in replacements:
+            if end <= marker.start:
+                delta += len(replacement) - (end - start)
+            elif start < marker.end and end > marker.start:
+                raise ValueError("source replacement overlaps an existing generated footnote marker")
+        result.append(marker.model_copy(update={"start": marker.start + delta, "end": marker.end + delta}))
+    return result
+
+
+def _replace_style_range(
+    runs: Sequence[TextStyleRun], start: int, end: int, replacement_length: int
+) -> list[TextStyleRun]:
+    """Rebase ranges through one known replacement without text matching heuristics."""
+    delta = replacement_length - (end - start)
+    result: list[TextStyleRun] = []
+    for run in runs:
+        if run.end <= start:
+            result.append(run)
+        elif run.start >= end:
+            result.append(run.model_copy(update={"start": run.start + delta, "end": run.end + delta}))
+        else:
+            if run.start < start:
+                result.append(run.model_copy(update={"end": start}))
+            if run.end > end:
+                result.append(
+                    run.model_copy(update={"start": start + replacement_length, "end": run.end + delta})
+                )
+    return result
 
 
 def link_footnotes(
@@ -2024,13 +2333,15 @@ def link_footnotes(
             labels_by_index[index] = label
             notes_by_label[label].append(index)
 
-    links_by_reference: dict[int, list[tuple[int, _FootnoteMarker]]] = defaultdict(list)
+    links_by_reference: dict[int, list[tuple[int, _FootnoteMarker, tuple[int, int]]]] = defaultdict(list)
     for reference_index, (element, semantic) in enumerate(zip(elements, semantic_blocks, strict=True)):
         if element.element_type in {"footnote", "header", "footer", "note"}:
             continue
         reference_page = semantic.page_numbers[-1]
-        for marker in _semantic_reference_markers(semantic):
-            if _looks_like_formula_script(marker):
+        markers = _semantic_reference_markers(semantic)
+        marker_spans = _reference_marker_spans(element.content, markers)
+        for marker, marker_span in zip(markers, marker_spans, strict=True):
+            if marker_span is None or _looks_like_formula_script(marker):
                 continue
             candidates = notes_by_label.get(marker.label, [])
             same_page = [
@@ -2052,15 +2363,11 @@ def link_footnotes(
                 if len(nearby) != 1:
                     continue
                 note_index = nearby[0]
-            if _replace_reference_marker(element.content, marker) == element.content:
-                continue
-            pair = (note_index, marker)
-            if pair not in links_by_reference[reference_index]:
-                links_by_reference[reference_index].append(pair)
+            links_by_reference[reference_index].append((note_index, marker, marker_span))
 
     references_by_note: dict[int, list[int]] = defaultdict(list)
     for reference_index, links in links_by_reference.items():
-        for note_index, _marker in links:
+        for note_index, _marker, _marker_span in links:
             if reference_index not in references_by_note[note_index]:
                 references_by_note[note_index].append(reference_index)
 
@@ -2068,16 +2375,41 @@ def link_footnotes(
     for index, element in enumerate(elements):
         structure = element.structure
         content = element.content
+        style_runs = list(structure.style_runs)
         linked_ids = list(structure.linked_element_ids)
-        for note_index, marker in links_by_reference.get(index, []):
+        reference_links = links_by_reference.get(index, [])
+        for note_index, _marker, _marker_span in reference_links:
             note_id = elements[note_index].element_id
             if note_id not in linked_ids:
                 linked_ids.append(note_id)
-            content = _replace_reference_marker(content, marker)
+        replacements = [
+            (marker_span[0], marker_span[1], f"[^{marker.label}]")
+            for _note_index, marker, marker_span in sorted(reference_links, key=lambda item: item[2])
+        ]
+        generated_ranges = _rebase_generated_marker_ranges(
+            inline_footnote_marker_ranges(element), replacements
+        )
+        cumulative_delta = 0
+        for start, end, replacement in replacements:
+            final_start = start + cumulative_delta
+            generated_ranges.append(
+                InlineFootnoteMarkerRange(
+                    start=final_start,
+                    end=final_start + len(replacement),
+                    label=replacement[2:-1],
+                )
+            )
+            cumulative_delta += len(replacement) - (end - start)
+        generated_ranges.sort(key=lambda marker: (marker.start, marker.end, marker.label))
+        for start, end, replacement in reversed(replacements):
+            style_runs = _replace_style_range(style_runs, start, end, len(replacement))
+            content = content[:start] + replacement + content[end:]
 
         footnote = structure.footnote
         if footnote is not None and index in labels_by_index:
             reference_ids = [elements[item].element_id for item in references_by_note.get(index, [])]
+            if not reference_ids and footnote.association_confident:
+                reference_ids = list(footnote.reference_element_ids)
             footnote = footnote.model_copy(
                 update={
                     "label": labels_by_index[index],
@@ -2089,11 +2421,17 @@ def link_footnotes(
                 if reference_id not in linked_ids:
                     linked_ids.append(reference_id)
 
+        properties = list(structure.properties)
+        if replacements:
+            properties = [prop for prop in properties if prop.key != "inline_footnote_markers"]
+            properties.append(inline_footnote_marker_property(generated_ranges))
         updated_structure = ElementStructure.model_validate(
             structure.model_dump(mode="json")
             | {
                 "footnote": None if footnote is None else footnote.model_dump(mode="json"),
+                "style_runs": [run.model_dump(mode="json") for run in style_runs],
                 "linked_element_ids": linked_ids,
+                "properties": [prop.model_dump(mode="json") for prop in properties],
             }
         )
         result.append(element.model_copy(update={"content": content, "structure": updated_structure}))

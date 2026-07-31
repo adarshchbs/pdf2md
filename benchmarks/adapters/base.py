@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -40,12 +43,75 @@ class AdapterRegistry(Mapping[str, BenchmarkAdapter]):
         return len(self._factories)
 
 
+@dataclass(frozen=True, slots=True)
+class ImmutableFileSnapshot:
+    data: bytes
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+def snapshot_regular_file(path: Path) -> ImmutableFileSnapshot:
+    """Read one immutable byte snapshot without following or reopening symlinks."""
+    initial_path_stat = path.lstat()
+    if stat.S_ISLNK(initial_path_stat.st_mode):
+        raise ValueError(f"source path cannot be a symlink: {path}")
+    if not stat.S_ISREG(initial_path_stat.st_mode):
+        raise ValueError(f"source path must be a regular file: {path}")
+
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if path.is_symlink():
+            raise ValueError(f"source path cannot be a symlink: {path}") from error
+        raise
+    try:
+        before = os.fstat(descriptor)
+        initial_identity = _file_identity(initial_path_stat)
+        before_identity = _file_identity(before)
+        if not stat.S_ISREG(before.st_mode) or before_identity != initial_identity:
+            raise ValueError("source path changed before immutable snapshot read")
+        data = _read_fd_bytes(descriptor)
+        after_identity = _file_identity(os.fstat(descriptor))
+        if after_identity != before_identity or len(data) != before_identity.size:
+            raise ValueError("source file mutated during immutable snapshot read")
+        final_path_stat = path.lstat()
+        if stat.S_ISLNK(final_path_stat.st_mode) or _file_identity(final_path_stat) != before_identity:
+            raise ValueError("source path was replaced during immutable snapshot read")
+    finally:
+        os.close(descriptor)
+    return ImmutableFileSnapshot(data=data, sha256=hashlib.sha256(data).hexdigest())
+
+
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return snapshot_regular_file(path).sha256
+
+
+def _read_fd_bytes(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _file_identity(value: os.stat_result) -> _FileIdentity:
+    return _FileIdentity(
+        device=value.st_dev,
+        inode=value.st_ino,
+        size=value.st_size,
+        mtime_ns=value.st_mtime_ns,
+        ctime_ns=value.st_ctime_ns,
+    )
 
 
 def config_sha256(config: Mapping[str, object]) -> str:

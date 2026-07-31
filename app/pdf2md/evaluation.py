@@ -16,7 +16,7 @@ from scipy.optimize import linear_sum_assignment
 from app.pdf2md.schema import BoundingBox, DocumentElement, SchemaModel, TableCell, TableStructure
 from app.pdf2md.tables import render_table, strict_table_classification
 
-EVALUATOR_SEMANTICS_VERSION = "1.1.0"
+EVALUATOR_SEMANTICS_VERSION = "1.3.0"
 
 _ALIGNMENT_THRESHOLD = 0.35
 _MIN_TEXT_SIMILARITY = 0.5
@@ -24,7 +24,14 @@ _MIN_FIGURE_GEOMETRY_IOU = 0.2
 _MAX_PAGE_BACKGROUND_AREA_RATIO = 0.9
 _MIN_COMPONENT_LENGTH = 4
 _MIN_RELATION_COVERAGE = 0.8
-_PROVENANCE_ONLY_PROPERTY_KEYS = frozenset({"source_note", "inline_footnote_markers"})
+_PROVENANCE_ONLY_PROPERTY_KEYS = frozenset({
+    "source_note",
+    "inline_footnote_markers",
+    "table_diagnostic_v1",
+    "table_span_suppression_v1",
+    "table_structural_source_item_ids",
+    "source_table_span_suppression_v1",
+})
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
@@ -988,7 +995,11 @@ def _semantic_element_text(
             return _character_error_text(element)
         return _normalize_text(_strict_render(element))
 
-    content = element.content
+    content = (
+        _strict_render(element, canonical_footnote_labels=known_labels)
+        if table_projection == "render"
+        else element.content
+    )
     content = re.sub(
         r"\[\^(?P<label>[^\]\r\n]+)\]",
         lambda match: match.group("label") if match.group("label") in known_labels else match.group(0),
@@ -1008,7 +1019,7 @@ def _semantic_element_text(
     return _normalize_text(f"{label} {body}")
 
 
-def _comparison_payload(element: DocumentElement, *, include_provenance: bool = True) -> str:
+def _comparison_payload(element: DocumentElement, *, include_provenance: bool = False) -> str:
     payload = cast(
         JsonValue,
         element.model_dump(mode="json", exclude={"element_id", "order", "annotation"}),
@@ -1102,10 +1113,12 @@ def _fragment_pages(element: DocumentElement) -> set[int]:
     return {fragment.page_number for fragment in element.fragments}
 
 
-def _strict_render(element: DocumentElement) -> str:
+def _strict_render(element: DocumentElement, *, canonical_footnote_labels: set[str] | None = None) -> str:
     table = element.structure.table
     if element.element_type != "table" or table is None:
-        return element.content
+        from app.pdf2md.engine import render_element
+
+        return render_element(element, canonical_footnote_labels=canonical_footnote_labels)
     representation, reasons = strict_table_classification(table)
     strict_table = table.model_copy(
         update={"representation": representation, "classification_reasons": reasons}

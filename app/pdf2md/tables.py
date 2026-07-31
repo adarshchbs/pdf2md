@@ -7,8 +7,9 @@ from typing import Literal, get_args
 from pydantic import Field
 
 from app.pdf2md.schema import SchemaModel, TableCell, TableStructure
+from app.pdf2md.table_provenance import TableDiagnostic, TableDiagnosticOutcome, TableDiagnosticStage
 
-RENDERER_SEMANTICS_VERSION = "1.1.0"
+RENDERER_SEMANTICS_VERSION = "1.3.0"
 
 HtmlReason = Literal[
     "no_header",
@@ -35,7 +36,11 @@ class TableFeatures(SchemaModel):
     has_ambiguous_continuation: bool = False
 
 
-def classify_table(features: TableFeatures) -> tuple[Literal["markdown", "html"], list[str]]:
+def classify_table(
+    features: TableFeatures,
+    *,
+    diagnostics: list[TableDiagnostic] | None = None,
+) -> tuple[Literal["markdown", "html"], list[str]]:
     features = TableFeatures.model_validate(features.model_dump(), strict=True)
     occupied = _validate_layout(
         features.row_count,
@@ -64,7 +69,22 @@ def classify_table(features: TableFeatures) -> tuple[Literal["markdown", "html"]
     if features.has_ambiguous_continuation:
         reasons.append("ambiguous_continuation")
 
-    return ("html", reasons) if reasons else ("markdown", [])
+    representation: Literal["markdown", "html"] = "html" if reasons else "markdown"
+    if diagnostics is not None:
+        diagnostics.append(
+            TableDiagnostic(
+                stage=TableDiagnosticStage.RENDERING_CLASSIFICATION,
+                outcome=TableDiagnosticOutcome.ACCEPTED,
+                reason=",".join(reasons) or representation,
+                metrics=(
+                    ("column_count", features.column_count),
+                    ("header_row_count", features.header_row_count),
+                    ("representation", representation),
+                    ("row_count", features.row_count),
+                ),
+            )
+        )
+    return (representation, reasons) if reasons else (representation, [])
 
 
 def strict_table_classification(table: TableStructure) -> tuple[Literal["markdown", "html"], list[str]]:

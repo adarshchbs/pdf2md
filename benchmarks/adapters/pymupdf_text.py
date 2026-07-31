@@ -9,7 +9,13 @@ from typing import Final, cast
 import pymupdf
 from pydantic import JsonValue
 
-from benchmarks.adapters.base import config_sha256, failed_run, sha256_file
+from app.pdf2md.pymupdf_runtime import open_document
+from benchmarks.adapters.base import (
+    ImmutableFileSnapshot,
+    config_sha256,
+    failed_run,
+    snapshot_regular_file,
+)
 from benchmarks.canonical import (
     AdapterRun,
     CanonicalElement,
@@ -35,9 +41,17 @@ class PyMuPDFTextAdapter:
 
     def process(self, pdf_path: Path) -> AdapterRun:
         started = time.perf_counter()
-        input_sha256 = sha256_file(pdf_path)
+        snapshot = snapshot_regular_file(pdf_path)
+        return self.process_snapshot(snapshot, started=started)
+
+    def process_snapshot(
+        self, snapshot: ImmutableFileSnapshot, *, started: float | None = None
+    ) -> AdapterRun:
+        """Extract from an already verified immutable source-byte snapshot."""
+        if started is None:
+            started = time.perf_counter()
         try:
-            with pymupdf.open(pdf_path) as document:
+            with open_document(stream=snapshot.data, filetype="pdf") as document:
                 records = [
                     {
                         "page_index": page_index,
@@ -51,15 +65,19 @@ class PyMuPDFTextAdapter:
         except pymupdf.FileDataError as error:
             return failed_run(error, time.perf_counter() - started)
 
-        provenance = CanonicalProvenance(
-            tool_name="PyMuPDF",
-            tool_version=importlib.metadata.version("pymupdf"),
-            mode="native-page-text",
-            input_sha256=input_sha256,
-            config_sha256=config_sha256(_CONFIG),
-        )
+        input_sha256 = snapshot.sha256
         pending_runtime = RuntimeStats(wall_seconds=0, peak_rss_bytes=None)
-        pages = [_page_from_record(input_sha256, record, pending_runtime, provenance) for record in records]
+        pages = [
+            _canonical_native_text_page(
+                page_index=int(record["page_index"]),
+                width=float(record["width"]),
+                height=float(record["height"]),
+                text=str(record["text"]),
+                runtime=pending_runtime,
+                input_sha256=input_sha256,
+            )
+            for record in records
+        ]
         runtime = RuntimeStats(wall_seconds=time.perf_counter() - started, peak_rss_bytes=None)
         pages = [page.model_copy(update={"runtime": runtime}) for page in pages]
         return AdapterRun(
@@ -70,14 +88,27 @@ class PyMuPDFTextAdapter:
         )
 
 
-def _page_from_record(
-    document_id: str,
-    record: dict[str, int | float | str],
+def _native_text_provenance(input_sha256: str) -> CanonicalProvenance:
+    """Return the provenance locked to this native adapter implementation."""
+    return CanonicalProvenance(
+        tool_name="PyMuPDF",
+        tool_version=importlib.metadata.version("pymupdf"),
+        mode="native-page-text",
+        input_sha256=input_sha256,
+        config_sha256=config_sha256(_CONFIG),
+    )
+
+
+def _canonical_native_text_page(
+    *,
+    page_index: int,
+    width: float,
+    height: float,
+    text: str,
     runtime: RuntimeStats,
-    provenance: CanonicalProvenance,
+    input_sha256: str,
 ) -> CanonicalPage:
-    page_index = int(record["page_index"])
-    text = str(record["text"])
+    """Build the sole canonical page shape emitted by the native adapter."""
     elements = (
         [
             CanonicalElement(
@@ -94,15 +125,15 @@ def _page_from_record(
         else []
     )
     page = CanonicalPage(
-        document_id=document_id,
+        document_id=input_sha256,
         page_index=page_index,
-        page_size=PageSize(width=float(record["width"]), height=float(record["height"]), unit="point"),
+        page_size=PageSize(width=width, height=height, unit="point"),
         markdown=text if elements else "",
         elements=elements,
         tables=[],
         figures=[],
         runtime=runtime,
-        provenance=provenance,
+        provenance=_native_text_provenance(input_sha256),
     )
     payload = canonical_json(page.model_dump(mode="json", exclude={"runtime", "output_sha256"})).encode()
     return page.model_copy(update={"output_sha256": hashlib.sha256(payload).hexdigest()})

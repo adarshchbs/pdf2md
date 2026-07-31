@@ -11,12 +11,16 @@ from click.testing import CliRunner
 
 from app.pdf2md import benchmark_batch
 from app.pdf2md.benchmark_batch import (
+    BatchResult,
     BenchmarkBatchManifest,
     aggregate_evaluations,
     build_regression_gate,
-    run_benchmark_batch,
     verify_benchmark_run,
 )
+from app.pdf2md.benchmark_batch import (
+    run_benchmark_batch as _run_benchmark_batch,
+)
+from app.pdf2md.bronze import BronzeManifest
 from app.pdf2md.cli import cli
 from app.pdf2md.evaluation import EVALUATOR_SEMANTICS_VERSION, EvaluationReport, evaluate_document
 from app.pdf2md.schema import (
@@ -28,6 +32,7 @@ from app.pdf2md.schema import (
     ParagraphStructure,
     write_document_elements,
 )
+from app.pdf2md.source_catalog import SourceCatalog
 from app.pdf2md.tables import RENDERER_SEMANTICS_VERSION
 
 
@@ -62,6 +67,29 @@ def _report() -> EvaluationReport:
     reference = [_element("doc", "silver")]
     candidate = [_element("doc", "candidate")]
     return evaluate_document(candidate, reference)
+
+
+def run_benchmark_batch(
+    manifest_path: Path,
+    reference_dir: Path,
+    baseline_candidate_dir: Path,
+    output_dir: Path,
+    *,
+    root_dir: Path,
+    corpus_partition_path: Path | None = None,
+    expected_corpus_partition_sha256: str | None = None,
+) -> BatchResult:
+    partition = corpus_partition_path or root_dir / "data/corpus-partition.json"
+    expected = expected_corpus_partition_sha256 or hashlib.sha256(partition.read_bytes()).hexdigest()
+    return _run_benchmark_batch(
+        manifest_path,
+        reference_dir,
+        baseline_candidate_dir,
+        output_dir,
+        root_dir=root_dir,
+        corpus_partition_path=partition,
+        expected_corpus_partition_sha256=expected,
+    )
 
 
 def test_aggregate_evaluations_excludes_nulls_and_reports_denominators() -> None:
@@ -159,6 +187,30 @@ def test_batch_manifest_rejects_holdout_layoutlm_and_inconsistent_counts() -> No
         BenchmarkBatchManifest.model_validate(payload)
 
 
+@pytest.mark.parametrize("field", ["source_path", "bundle_path"])
+def test_batch_manifest_rejects_spaced_layoutlm_paths(field: str) -> None:
+    payload = _batch_payload("sample")
+    selections = payload["selections"]
+    assert isinstance(selections, list)
+    selection = selections[0]
+    assert isinstance(selection, dict)
+    selection[field] = "data/Layout LM v2/sample.pdf"
+
+    with pytest.raises(ValueError, match="LayoutLM selection is forbidden"):
+        BenchmarkBatchManifest.model_validate(payload)
+
+
+def test_batch_manifest_does_not_confuse_layout_ml_with_layoutlm() -> None:
+    payload = _batch_payload("sample")
+    selections = payload["selections"]
+    assert isinstance(selections, list)
+    selection = selections[0]
+    assert isinstance(selection, dict)
+    selection["source_path"] = "data/layout-ml/source.pdf"
+
+    BenchmarkBatchManifest.model_validate(payload)
+
+
 def test_batch_run_writes_deterministic_artifacts_and_requires_fresh_destination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -248,10 +300,17 @@ def test_archived_provenance_is_portable_complete_and_fails_fast_on_mismatch(
     assert str(tmp_path) not in serialized
     assert "created_at" not in serialized
     assert provenance.run_id.startswith("sha256-")
-    assert provenance.runner_version == "4.0.0"
-    assert provenance.report_schema_version == "4.0.0"
+    assert provenance.schema_version == "4.0.0"
+    assert provenance.runner_version == "5.0.0"
+    assert provenance.report_schema_version == "5.0.0"
+    assert json.loads((output_dir / "anchor.json").read_text())["schema_version"] == "3.0.0"
+    assert json.loads((output_dir / "run.json").read_text())["schema_version"] == "5.0.0"
+    assert provenance.invocation.corpus_partition == "data/corpus-partition.json"
+    assert provenance.invocation.expected_corpus_partition_sha256 == setup["corpus_partition_sha256"]
+    assert provenance.inputs.corpus_partition.files[0].sha256 == setup["corpus_partition_sha256"]
     assert set(provenance.inputs.model_dump()) == {
         "manifest",
+        "corpus_partition",
         "source",
         "bronze",
         "reference",
@@ -285,7 +344,7 @@ def test_archived_provenance_is_portable_complete_and_fails_fast_on_mismatch(
         ".claude/skills/pdf-structure-curation/SKILL.md"
     ]
     assert provenance.curation_compatibility.model_dump() == {
-        "element_schema_version": "1.0.0",
+        "element_schema_version": "1.2.0",
         "source_catalog_schema_version": "2.0.0",
         "renderer_semantics_version": RENDERER_SEMANTICS_VERSION,
         "evaluator_semantics_version": EVALUATOR_SEMANTICS_VERSION,
@@ -415,8 +474,17 @@ def test_curation_guidance_change_alters_future_run_identity(
 
 
 @pytest.mark.parametrize("mode", ["missing", "mismatch"])
-def test_curation_guidance_compatibility_fails_before_output(tmp_path: Path, mode: str) -> None:
+def test_curation_guidance_compatibility_fails_before_protected_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
     setup = _setup_batch(tmp_path)
+    monkeypatch.setattr(
+        benchmark_batch,
+        "_prepare_selection",
+        lambda *_args, **_kwargs: pytest.fail("protected artifact preflight must not run"),
+    )
     guidance = tmp_path / ".claude/skills/pdf-structure-curation/SKILL.md"
     if mode == "missing":
         guidance.unlink()
@@ -486,6 +554,36 @@ def test_fingerprint_inventory_distinguishes_added_removed_and_changed_files(tmp
     ])
 
     assert len({baseline.root_sha256, added.root_sha256, removed.root_sha256, changed.root_sha256}) == 4
+
+
+def test_source_fingerprinting_partition_mutation_blocks_next_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partition = tmp_path / "partition.json"
+    partition.write_text(json.dumps({"documents": []}), encoding="utf-8")
+    trusted_bytes = partition.read_bytes()
+    first = tmp_path / "first-source.pdf"
+    second = tmp_path / "second-source.pdf"
+    first.write_bytes(b"first synthetic source")
+    second.write_bytes(b"second synthetic source")
+    original = benchmark_batch._fingerprint_file  # pyright: ignore[reportPrivateUsage]
+
+    def fingerprint_then_mutate(logical: str, path: Path) -> benchmark_batch.FileHash:
+        if logical == "second/source.pdf":
+            pytest.fail("next protected source must not open after partition mutation")
+        result = original(logical, path)
+        partition.write_text(json.dumps({"documents": [{"split": "holdout"}]}), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(benchmark_batch, "_fingerprint_file", fingerprint_then_mutate)
+
+    with pytest.raises(ValueError, match="changed after trusted TRAIN preflight"):
+        benchmark_batch._fingerprint_paths_with_partition_guard(  # pyright: ignore[reportPrivateUsage]
+            [("first/source.pdf", first), ("second/source.pdf", second)],
+            trusted_partition_path=partition,
+            trusted_partition_bytes=trusted_bytes,
+        )
 
 
 def test_legacy_extraction_seam_fails_closed_on_unresolved_source_items(
@@ -620,6 +718,452 @@ def test_batch_preflight_rejects_external_inputs_outputs_and_bronze_artifact_esc
         )
 
 
+@pytest.mark.parametrize("split", ["validation", "holdout"])
+def test_train_preflight_rejects_renamed_non_train_member_before_artifacts_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    split: str,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    payload = json.loads(setup["manifest"].read_text(encoding="utf-8"))
+    payload["selections"][0]["source_path"] = "data/renamed-safe-source.pdf"
+    setup["manifest"].write_text(json.dumps(payload), encoding="utf-8")
+    setup["corpus_partition"].write_text(
+        json.dumps({
+            "documents": [
+                {
+                    "local_path": "data/renamed-safe-source.pdf",
+                    "sha256": setup["digest"],
+                    "split": split,
+                }
+            ]
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        benchmark_batch,
+        "_prepare_selection",
+        lambda *_args, **_kwargs: pytest.fail("artifact preflight must not run"),
+    )
+
+    with pytest.raises(ValueError, match="not assigned to TRAIN"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_train_preflight_rejects_partition_hash_mismatch_before_artifacts_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    monkeypatch.setattr(
+        benchmark_batch,
+        "_prepare_selection",
+        lambda *_args, **_kwargs: pytest.fail("artifact preflight must not run"),
+    )
+
+    with pytest.raises(ValueError, match="does not match trusted expected value"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+            expected_corpus_partition_sha256="0" * 64,
+        )
+
+
+def test_train_preflight_rejects_missing_member_before_artifacts_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    setup["corpus_partition"].write_text(json.dumps({"documents": []}), encoding="utf-8")
+    monkeypatch.setattr(
+        benchmark_batch,
+        "_prepare_selection",
+        lambda *_args, **_kwargs: pytest.fail("artifact preflight must not run"),
+    )
+
+    with pytest.raises(ValueError, match="missing from corpus partition"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_train_preflight_rejects_selection_sha_mismatch_before_artifacts_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    payload = json.loads(setup["manifest"].read_text(encoding="utf-8"))
+    payload["selections"][0]["source_sha256"] = "1" * 64
+    setup["manifest"].write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        benchmark_batch,
+        "_prepare_selection",
+        lambda *_args, **_kwargs: pytest.fail("artifact preflight must not run"),
+    )
+
+    with pytest.raises(ValueError, match="SHA-256 differs from corpus partition"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_train_preflight_rejects_noncanonical_lexical_selection_path() -> None:
+    payload = _batch_payload("sample", "1" * 64)
+    selections = payload["selections"]
+    assert isinstance(selections, list)
+    first = selections[0]
+    assert isinstance(first, dict)
+    first["source_path"] = "data/./source.pdf"
+
+    with pytest.raises(ValueError, match="exact portable lexical path"):
+        BenchmarkBatchManifest.model_validate(payload)
+
+
+def test_train_preflight_rejects_symlink_source_alias(tmp_path: Path) -> None:
+    source = tmp_path / "data/source.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    alias = tmp_path / "data/source-alias.pdf"
+    alias.symlink_to(source)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    payload = _batch_payload("sample", digest)
+    selections = payload["selections"]
+    assert isinstance(selections, list)
+    first = selections[0]
+    assert isinstance(first, dict)
+    first["source_path"] = "data/source-alias.pdf"
+    manifest = BenchmarkBatchManifest.model_validate(payload)
+    partition = {"documents": [{"local_path": "data/source-alias.pdf", "sha256": digest, "split": "train"}]}
+
+    with pytest.raises(ValueError, match="must not use a symlink alias"):
+        benchmark_batch._validate_train_partition(  # pyright: ignore[reportPrivateUsage]
+            json.dumps(partition).encode(), manifest.selections, tmp_path
+        )
+
+
+@pytest.mark.parametrize(
+    "model_family",
+    ["LayoutLMv2", "Layout LM v2", "Layout\tLM", "Layout LM", "Layout LM v2"],
+)
+def test_train_preflight_rejects_renamed_layoutlm_partition_metadata_before_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_family: str,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    payload = json.loads(setup["manifest"].read_text(encoding="utf-8"))
+    payload["selections"][0]["source_path"] = "data/renamed-safe-source.pdf"
+    setup["manifest"].write_text(json.dumps(payload), encoding="utf-8")
+    setup["corpus_partition"].write_text(
+        json.dumps({
+            "documents": [
+                {
+                    "local_path": "data/renamed-safe-source.pdf",
+                    "sha256": setup["digest"],
+                    "split": "train",
+                    "metadata": {"model_family": model_family},
+                }
+            ]
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        benchmark_batch,
+        "_prepare_selection",
+        lambda *_args, **_kwargs: pytest.fail("artifact preflight must not run"),
+    )
+
+    with pytest.raises(ValueError, match="LayoutLM corpus partition member is forbidden"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_train_partition_metadata_does_not_confuse_layout_ml_with_layoutlm(tmp_path: Path) -> None:
+    source = tmp_path / "data/source.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    manifest = BenchmarkBatchManifest.model_validate(_batch_payload("sample", digest))
+    partition = {
+        "documents": [
+            {
+                "local_path": "data/source.pdf",
+                "sha256": digest,
+                "split": "train",
+                "metadata": {"title": "Layout ML benchmark"},
+            }
+        ]
+    }
+
+    benchmark_batch._validate_train_partition(  # pyright: ignore[reportPrivateUsage]
+        json.dumps(partition).encode(), manifest.selections, tmp_path
+    )
+
+
+def test_partition_mutation_after_compatibility_is_rejected_before_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    original = benchmark_batch._static_provenance_inputs  # pyright: ignore[reportPrivateUsage]
+
+    def mutate_after_compatibility(root: Path):
+        result = original(root)
+        setup["corpus_partition"].write_text(json.dumps({"documents": []}), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(benchmark_batch, "_static_provenance_inputs", mutate_after_compatibility)
+    monkeypatch.setattr(
+        benchmark_batch,
+        "verify_bronze_bundle",
+        lambda *_args, **_kwargs: pytest.fail("bronze must not open after partition mutation"),
+    )
+
+    with pytest.raises(ValueError, match="changed after trusted TRAIN preflight"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_partition_mutation_during_bronze_verification_blocks_source_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    original_verify = benchmark_batch.verify_bronze_bundle
+    original_sha256 = benchmark_batch._sha256  # pyright: ignore[reportPrivateUsage]
+    source_path = tmp_path / "data/source.pdf"
+
+    def verify_then_mutate(bundle_path: Path) -> BronzeManifest:
+        result = original_verify(bundle_path)
+        setup["corpus_partition"].write_text(json.dumps({"documents": []}), encoding="utf-8")
+        return result
+
+    def reject_source_hash(path: Path) -> str:
+        if path == source_path:
+            pytest.fail("source PDF must not open after partition mutation")
+        return original_sha256(path)
+
+    monkeypatch.setattr(benchmark_batch, "verify_bronze_bundle", verify_then_mutate)
+    monkeypatch.setattr(benchmark_batch, "_sha256", reject_source_hash)
+
+    with pytest.raises(ValueError, match="changed after trusted TRAIN preflight"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_partition_mutation_after_artifact_preflight_blocks_provenance_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    original = benchmark_batch._prepare_selection  # pyright: ignore[reportPrivateUsage]
+
+    def prepare_then_mutate(
+        selection: benchmark_batch.BatchSelection,
+        root: Path,
+        reference_dir: Path,
+        baseline_candidate_dir: Path,
+        *,
+        trusted_partition_path: Path,
+        trusted_partition_bytes: bytes,
+    ) -> object:
+        result = original(
+            selection,
+            root,
+            reference_dir,
+            baseline_candidate_dir,
+            trusted_partition_path=trusted_partition_path,
+            trusted_partition_bytes=trusted_partition_bytes,
+        )
+        setup["corpus_partition"].write_text(json.dumps({"documents": []}), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(benchmark_batch, "_prepare_selection", prepare_then_mutate)
+
+    with pytest.raises(ValueError, match="changed after trusted TRAIN preflight"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_partition_mutation_after_provenance_foundation_blocks_extraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    original = benchmark_batch._build_provenance_foundation  # pyright: ignore[reportPrivateUsage]
+
+    def build_then_mutate(
+        root: Path,
+        manifest_path: Path,
+        corpus_partition_path: Path,
+        trusted_partition_bytes: bytes,
+        expected_corpus_partition_sha256: str,
+        reference_dir: Path,
+        baseline_candidate_dir: Path,
+        selections: list[benchmark_batch.BatchSelection],
+        *,
+        runtime: benchmark_batch.RuntimeVersions,
+        curation_compatibility: benchmark_batch.CurationCompatibility,
+        code_fingerprints: benchmark_batch.CodeFingerprints,
+    ) -> object:
+        result = original(
+            root,
+            manifest_path,
+            corpus_partition_path,
+            trusted_partition_bytes,
+            expected_corpus_partition_sha256,
+            reference_dir,
+            baseline_candidate_dir,
+            selections,
+            runtime=runtime,
+            curation_compatibility=curation_compatibility,
+            code_fingerprints=code_fingerprints,
+        )
+        setup["corpus_partition"].write_text(json.dumps({"documents": []}), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(benchmark_batch, "_build_provenance_foundation", build_then_mutate)
+    monkeypatch.setattr(
+        benchmark_batch,
+        "extract_document_elements",
+        lambda *_args, **_kwargs: pytest.fail("PDF extraction must not run after partition mutation"),
+    )
+
+    with pytest.raises(ValueError, match="changed after trusted TRAIN preflight"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_partition_mutation_during_extraction_blocks_source_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    original_sha256 = benchmark_batch._sha256  # pyright: ignore[reportPrivateUsage]
+    source_path = tmp_path / "data/source.pdf"
+    partition_mutated = False
+
+    def extract_then_mutate(_path: Path, *, pages: list[int]) -> list[DocumentElement]:
+        nonlocal partition_mutated
+        setup["corpus_partition"].write_text(json.dumps({"documents": []}), encoding="utf-8")
+        partition_mutated = True
+        return [_element(setup["digest"], "candidate", page=pages[0])]
+
+    def reject_source_reopen(path: Path) -> str:
+        if partition_mutated and path == source_path:
+            pytest.fail("source PDF must not reopen after partition mutation")
+        return original_sha256(path)
+
+    monkeypatch.setattr(benchmark_batch, "extract_document_elements", extract_then_mutate)
+    monkeypatch.setattr(benchmark_batch, "_sha256", reject_source_reopen)
+
+    with pytest.raises(ValueError, match="changed after trusted TRAIN preflight"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_partition_mutation_during_catalog_validation_blocks_source_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup_batch(tmp_path)
+    original_validate = benchmark_batch.validate_source_catalog
+    original_sha256 = benchmark_batch._sha256  # pyright: ignore[reportPrivateUsage]
+    source_path = tmp_path / "data/source.pdf"
+    partition_mutated = False
+
+    def validate_then_mutate(elements: list[DocumentElement], catalog: SourceCatalog) -> None:
+        nonlocal partition_mutated
+        original_validate(elements, catalog)
+        setup["corpus_partition"].write_text(json.dumps({"documents": []}), encoding="utf-8")
+        partition_mutated = True
+
+    def reject_source_reopen(path: Path) -> str:
+        if partition_mutated and path == source_path:
+            pytest.fail("source PDF must not reopen after catalog-validation mutation")
+        return original_sha256(path)
+
+    monkeypatch.setattr(
+        benchmark_batch,
+        "extract_document_elements",
+        lambda _path, *, pages: [_element(setup["digest"], "candidate", page=pages[0])],
+    )
+    monkeypatch.setattr(benchmark_batch, "validate_source_catalog", validate_then_mutate)
+    monkeypatch.setattr(benchmark_batch, "_sha256", reject_source_reopen)
+
+    with pytest.raises(ValueError, match="changed after trusted TRAIN preflight"):
+        run_benchmark_batch(
+            setup["manifest"],
+            setup["references"],
+            setup["baseline"],
+            tmp_path / "output",
+            root_dir=tmp_path,
+        )
+
+
+def test_train_partition_membership_is_permutation_invariant(tmp_path: Path) -> None:
+    manifest = BenchmarkBatchManifest.model_validate(_batch_payload("sample", "1" * 64))
+    selected = manifest.selections
+    documents = [
+        {"local_path": "data/unrelated.pdf", "sha256": "2" * 64, "split": "validation"},
+        {"local_path": "data/source.pdf", "sha256": "1" * 64, "split": "train"},
+    ]
+
+    benchmark_batch._validate_train_partition(  # pyright: ignore[reportPrivateUsage]
+        json.dumps({"documents": documents}).encode(), selected, tmp_path
+    )
+    benchmark_batch._validate_train_partition(  # pyright: ignore[reportPrivateUsage]
+        json.dumps({"documents": list(reversed(documents))}).encode(), selected, tmp_path
+    )
+
+
 def test_benchmark_batch_cli_returns_failure_when_gate_blocks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -641,6 +1185,10 @@ def test_benchmark_batch_cli_returns_failure_when_gate_blocks(
             str(setup["references"]),
             str(setup["baseline"]),
             str(output_dir),
+            "--corpus-partition",
+            str(setup["corpus_partition"]),
+            "--expected-corpus-partition-sha256",
+            setup["corpus_partition_sha256"],
             "--root-dir",
             str(tmp_path),
         ],
@@ -653,6 +1201,8 @@ def test_benchmark_batch_cli_returns_failure_when_gate_blocks(
 
 class _BatchSetup(TypedDict):
     manifest: Path
+    corpus_partition: Path
+    corpus_partition_sha256: str
     references: Path
     baseline: Path
     digest: str
@@ -676,7 +1226,7 @@ def _setup_batch(
     guidance.write_text(
         "---\n"
         "name: pdf-structure-curation\n"
-        'element-schema-version: "1.0.0"\n'
+        'element-schema-version: "1.2.0"\n'
         'source-catalog-schema-version: "2.0.0"\n'
         f'renderer-semantics-version: "{RENDERER_SEMANTICS_VERSION}"\n'
         f'evaluator-semantics-version: "{EVALUATOR_SEMANTICS_VERSION}"\n'
@@ -687,6 +1237,12 @@ def _setup_batch(
     source = data_dir / "source.pdf"
     source.write_bytes(b"synthetic-pdf")
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    corpus_partition = data_dir / "corpus-partition.json"
+    corpus_partition.write_text(
+        json.dumps({"documents": [{"local_path": "data/source.pdf", "sha256": digest, "split": "train"}]}),
+        encoding="utf-8",
+    )
+    corpus_partition_sha256 = hashlib.sha256(corpus_partition.read_bytes()).hexdigest()
     bronze_manifest = {
         "schema_version": "1.0.0",
         "source_name": "source.pdf",
@@ -713,16 +1269,18 @@ def _setup_batch(
     write_document_elements([_element(digest, reference_stage)], references / "sample.parquet")
     write_document_elements([_element(digest, "candidate", page=baseline_page)], baseline / "sample.parquet")
     manifest = data_dir / "benchmark.json"
-    manifest.write_text(json.dumps(_batch_payload("sample"), sort_keys=True), encoding="utf-8")
+    manifest.write_text(json.dumps(_batch_payload("sample", digest), sort_keys=True), encoding="utf-8")
     return {
         "manifest": manifest,
+        "corpus_partition": corpus_partition,
+        "corpus_partition_sha256": corpus_partition_sha256,
         "references": references,
         "baseline": baseline,
         "digest": digest,
     }
 
 
-def _batch_payload(document_id: str) -> dict[str, object]:
+def _batch_payload(document_id: str, source_sha256: str = "0" * 64) -> dict[str, object]:
     return {
         "batch_id": "test",
         "selection_count": 1,
@@ -730,6 +1288,7 @@ def _batch_payload(document_id: str) -> dict[str, object]:
             {
                 "id": document_id,
                 "source_path": "data/source.pdf",
+                "source_sha256": source_sha256,
                 "pages": {"annotated": [1], "context": [], "requested": [1]},
                 "bundle_path": "data/bronze/sample",
                 "verification": {"status": "verified", "artifact_count": 0},

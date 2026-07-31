@@ -10,6 +10,71 @@ from typing import Protocol, cast
 
 BBox = tuple[float, float, float, float]
 _FINDER_GRID_V1 = "finder_grid_v1"
+DiagnosticValue = bool | int | float | str
+
+
+class TableDiagnosticStage(StrEnum):
+    """Stable table-pipeline stages exposed to diagnostic consumers."""
+
+    BOUNDARY_DETECTION = "boundary_detection"
+    BOUNDARY_FILTER = "boundary_filter"
+    BOUNDARY_DEDUPLICATION = "boundary_deduplication"
+    RECONSTRUCTION_STRATEGY = "reconstruction_strategy"
+    ROW_RECOVERY = "row_recovery"
+    COLUMN_RECOVERY = "column_recovery"
+    CELL_ASSIGNMENT = "cell_assignment"
+    SPAN_RECONSTRUCTION = "span_reconstruction"
+    RENDERING_CLASSIFICATION = "rendering_classification"
+    TABLE_QUALITY = "table_quality"
+    CONSUMPTION_SAFETY = "consumption_safety"
+
+
+class TableDiagnosticOutcome(StrEnum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    APPLIED = "applied"
+    UNCHANGED = "unchanged"
+
+
+@dataclass(frozen=True, slots=True)
+class TableDiagnostic:
+    """One deterministic, non-rendering observation at a table-pipeline seam."""
+
+    stage: TableDiagnosticStage
+    outcome: TableDiagnosticOutcome
+    reason: str | None = None
+    metrics: tuple[tuple[str, DiagnosticValue], ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.stage) is not TableDiagnosticStage:
+            raise TypeError("table diagnostic stage must be a TableDiagnosticStage")
+        if type(self.outcome) is not TableDiagnosticOutcome:
+            raise TypeError("table diagnostic outcome must be a TableDiagnosticOutcome")
+        if self.reason is not None and type(self.reason) is not str:
+            raise TypeError("table diagnostic reason must be a string or null")
+        if self.reason == "":
+            raise ValueError("table diagnostic reason must be null or nonempty")
+        if type(self.metrics) is not tuple or any(
+            type(metric) is not tuple or len(metric) != 2 for metric in self.metrics
+        ):
+            raise TypeError("table diagnostic metrics must be two-item tuples in a tuple")
+        names = tuple(name for name, _ in self.metrics)
+        if any(type(name) is not str for name in names):
+            raise TypeError("table diagnostic metric names must be strings")
+        if any(not name for name in names):
+            raise ValueError("table diagnostic metric names must not be empty")
+        if len(names) != len(set(names)):
+            raise ValueError("table diagnostic metric names must be unique")
+        if names != tuple(sorted(names)):
+            raise ValueError("table diagnostic metrics must be sorted by name")
+        for _, value in self.metrics:
+            if type(value) not in (bool, int, float, str):
+                raise TypeError("table diagnostic metric values must be exact JSON scalar types")
+            if type(value) is float and not math.isfinite(value):
+                raise ValueError("table diagnostic float metrics must be finite")
+
+    def metric(self, name: str) -> DiagnosticValue | None:
+        return next((value for key, value in self.metrics if key == name), None)
 
 
 class CoordinateFrame(StrEnum):
@@ -61,6 +126,7 @@ class NativeToken:
     baseline: float
     text: str
     canonical_bbox: BBox | None = None
+    duplicate_index: int = 1
 
     def __post_init__(self) -> None:
         _validate_bbox(self.bbox, "native token")
@@ -70,6 +136,8 @@ class NativeToken:
             raise ValueError("native token baseline must be finite")
         if not self.text or not self.text.strip():
             raise ValueError("native token text must not be blank")
+        if type(self.duplicate_index) is not int or self.duplicate_index < 1:
+            raise ValueError("native token duplicate_index must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +150,7 @@ class NativeRule:
     x1: float
     y: float
     canonical_geometry: tuple[float, float, float, float] | None = None
+    duplicate_index: int = 1
 
     def __post_init__(self) -> None:
         if not all(math.isfinite(value) for value in (self.x0, self.x1, self.y)):
@@ -94,6 +163,8 @@ class NativeRule:
             x0, y0, x1, y1 = self.canonical_geometry
             if x0 == x1 and y0 == y1:
                 raise ValueError("canonical native rule must not be a point")
+        if type(self.duplicate_index) is not int or self.duplicate_index < 1:
+            raise ValueError("native rule duplicate_index must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +197,7 @@ class TableProvenance:
     native_rule_ids: tuple[NativeRuleId, ...] = ()
     native_tokens: tuple[NativeToken, ...] = ()
     native_rules: tuple[NativeRule, ...] = ()
+    diagnostics: tuple[TableDiagnostic, ...] = ()
 
     def __post_init__(self) -> None:
         band_ids = tuple(band.band_id for band in self.geometric_bands)
@@ -228,12 +300,14 @@ class TableReconstruction:
     adapter: str
     bbox: BBox
     cells: tuple[BBox, ...]
+    finder_cells: tuple[BBox, ...]
     logical_cells: tuple[LogicalCellInput, ...]
     extracted_rows: tuple[tuple[str | None, ...], ...]
     header: FinderHeaderInput
     provenance: ProvenanceSummary | None
     logical_grid_indices: bool = False
     recovered_header_row_count: int | None = None
+    diagnostics: tuple[TableDiagnostic, ...] = ()
 
     def __post_init__(self) -> None:
         if self.adapter != _FINDER_GRID_V1:
@@ -241,6 +315,20 @@ class TableReconstruction:
         _validate_bbox(self.bbox, "table")
         if not self.cells:
             raise ValueError("finder grid must contain at least one cell")
+
+
+def _strategy_diagnostic(
+    outcome: TableDiagnosticOutcome,
+    strategy: str,
+) -> TableDiagnostic:
+    return TableDiagnostic(
+        stage=TableDiagnosticStage.RECONSTRUCTION_STRATEGY,
+        outcome=outcome,
+        reason=strategy,
+        metrics=(("failure_reason", "gates_not_satisfied"),)
+        if outcome == TableDiagnosticOutcome.REJECTED
+        else (),
+    )
 
 
 def reconstruct_table(
@@ -252,12 +340,17 @@ def reconstruct_table(
     cells = tuple(_coordinates(cell, "finder grid cell") for cell in snapshot.cells)
     if not cells:
         raise ValueError("finder grid must contain at least one cell")
+    finder_cells = cells
     extracted_rows = tuple(tuple(row) for row in snapshot.extract())
     header = FinderHeaderInput(
         external=bool(snapshot.header.external),
         names=tuple(snapshot.header.names),
     )
     geometry_rows = _geometry_rows(snapshot)
+    original_row_count = len(extracted_rows)
+    original_column_count = max((len(row) for row in extracted_rows), default=0)
+    strategy = "finder_grid_v1"
+    strategy_diagnostics: list[TableDiagnostic] = []
     logical_cells = (
         _logical_cells_from_rows(cells, geometry_rows, extracted_rows)
         if geometry_rows is not None
@@ -284,8 +377,13 @@ def reconstruct_table(
         )
         if external_header is not None:
             table_bbox, cells, logical_cells, extracted_rows, header = external_header
+            strategy = "external_financial_header"
+            strategy_diagnostics.append(_strategy_diagnostic(TableDiagnosticOutcome.APPLIED, strategy))
             logical_grid_indices = True
         else:
+            strategy_diagnostics.append(
+                _strategy_diagnostic(TableDiagnosticOutcome.REJECTED, "external_financial_header")
+            )
             external_grid_header = _reconstruct_rule_connected_external_header(
                 table_bbox,
                 cells,
@@ -303,8 +401,13 @@ def reconstruct_table(
                     header,
                     recovered_header_row_count,
                 ) = external_grid_header
+                strategy = "rule_connected_external_header"
+                strategy_diagnostics.append(_strategy_diagnostic(TableDiagnosticOutcome.APPLIED, strategy))
                 logical_grid_indices = True
             else:
+                strategy_diagnostics.append(
+                    _strategy_diagnostic(TableDiagnosticOutcome.REJECTED, "rule_connected_external_header")
+                )
                 ruled_inset = _reconstruct_ruled_inset_grid(
                     table_bbox,
                     geometry_rows,
@@ -313,9 +416,16 @@ def reconstruct_table(
                 )
                 if ruled_inset is not None:
                     cells, logical_cells, extracted_rows = ruled_inset
+                    strategy = "ruled_inset_grid"
+                    strategy_diagnostics.append(
+                        _strategy_diagnostic(TableDiagnosticOutcome.APPLIED, strategy)
+                    )
                     header = FinderHeaderInput(external=False, names=extracted_rows[0])
                     logical_grid_indices = True
                 else:
+                    strategy_diagnostics.append(
+                        _strategy_diagnostic(TableDiagnosticOutcome.REJECTED, "ruled_inset_grid")
+                    )
                     baseline_grid = _reconstruct_rule_backed_baseline_grid(
                         table_bbox,
                         geometry_rows,
@@ -324,10 +434,17 @@ def reconstruct_table(
                     )
                     if baseline_grid is not None:
                         cells, logical_cells, extracted_rows = baseline_grid
+                        strategy = "rule_backed_baseline_grid"
+                        strategy_diagnostics.append(
+                            _strategy_diagnostic(TableDiagnosticOutcome.APPLIED, strategy)
+                        )
                         header = FinderHeaderInput(external=False, names=extracted_rows[0])
                         recovered_header_row_count = 1
                         logical_grid_indices = True
                     else:
+                        strategy_diagnostics.append(
+                            _strategy_diagnostic(TableDiagnosticOutcome.REJECTED, "rule_backed_baseline_grid")
+                        )
                         ruled_form = _reconstruct_rule_partitioned_form_grid(
                             table_bbox,
                             geometry_rows,
@@ -336,9 +453,19 @@ def reconstruct_table(
                         )
                         if ruled_form is not None:
                             table_bbox, cells, logical_cells, extracted_rows = ruled_form
+                            strategy = "rule_partitioned_form_grid"
+                            strategy_diagnostics.append(
+                                _strategy_diagnostic(TableDiagnosticOutcome.APPLIED, strategy)
+                            )
                             header = FinderHeaderInput(external=False, names=extracted_rows[0])
                             logical_grid_indices = True
-                        elif evidence.finder == FinderProvenance.BORDERLESS_TEXT:
+                        else:
+                            strategy_diagnostics.append(
+                                _strategy_diagnostic(
+                                    TableDiagnosticOutcome.REJECTED, "rule_partitioned_form_grid"
+                                )
+                            )
+                        if ruled_form is None and evidence.finder == FinderProvenance.BORDERLESS_TEXT:
                             reconstructed = _reconstruct_borderless_text(
                                 table_bbox,
                                 cells,
@@ -348,17 +475,54 @@ def reconstruct_table(
                             )
                             if reconstructed is not None:
                                 table_bbox, cells, logical_cells, extracted_rows = reconstructed
+                                strategy = "borderless_text_grid"
+                                strategy_diagnostics.append(
+                                    _strategy_diagnostic(TableDiagnosticOutcome.APPLIED, strategy)
+                                )
                                 logical_grid_indices = True
+                            else:
+                                strategy_diagnostics.append(
+                                    _strategy_diagnostic(
+                                        TableDiagnosticOutcome.REJECTED, "borderless_text_grid"
+                                    )
+                                )
+    if strategy == "finder_grid_v1":
+        strategy_diagnostics.append(_strategy_diagnostic(TableDiagnosticOutcome.UNCHANGED, "finder_grid_v1"))
+    final_row_count = len(extracted_rows)
+    final_column_count = max((len(row) for row in extracted_rows), default=0)
+    diagnostics = (
+        *strategy_diagnostics,
+        TableDiagnostic(
+            stage=TableDiagnosticStage.ROW_RECOVERY,
+            outcome=(
+                TableDiagnosticOutcome.APPLIED
+                if final_row_count != original_row_count
+                else TableDiagnosticOutcome.UNCHANGED
+            ),
+            metrics=(("after", final_row_count), ("before", original_row_count)),
+        ),
+        TableDiagnostic(
+            stage=TableDiagnosticStage.COLUMN_RECOVERY,
+            outcome=(
+                TableDiagnosticOutcome.APPLIED
+                if final_column_count != original_column_count
+                else TableDiagnosticOutcome.UNCHANGED
+            ),
+            metrics=(("after", final_column_count), ("before", original_column_count)),
+        ),
+    )
     return TableReconstruction(
         adapter=_FINDER_GRID_V1,
         bbox=table_bbox,
         cells=cells,
+        finder_cells=finder_cells,
         logical_cells=logical_cells,
         extracted_rows=extracted_rows,
         header=header,
         provenance=provenance,
         logical_grid_indices=logical_grid_indices,
         recovered_header_row_count=recovered_header_row_count,
+        diagnostics=diagnostics,
     )
 
 
@@ -1923,6 +2087,7 @@ def _associate_currency_tokens(
                         ),
                         baseline=(token.baseline + amount.baseline) / 2,
                         text=f"{token.text.strip()} {amount.text.strip()}",
+                        duplicate_index=token.duplicate_index,
                     )
                 )
                 consumed.add(token.token_id)
@@ -1952,6 +2117,7 @@ def _associate_currency_tokens(
                 ),
                 baseline=(previous.baseline + token.baseline) / 2,
                 text=f"{previous.text} {token.text}",
+                duplicate_index=previous.duplicate_index,
             )
         else:
             phrases.append(token)

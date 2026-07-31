@@ -11,6 +11,7 @@ import pymupdf
 from pydantic import JsonValue
 
 from app.pdf2md.engine import ExtractedDocument, extract_document_with_catalog
+from app.pdf2md.pymupdf_runtime import open_document
 from app.pdf2md.schema import DocumentElement, PageFragment
 from benchmarks.adapters.base import config_sha256, failed_run, sha256_file
 from benchmarks.canonical import (
@@ -58,7 +59,7 @@ class OurParserAdapter:
                 pdf_path,
                 annotator=str(_CONFIG["annotator"]),
             )
-            with pymupdf.open(pdf_path) as document:
+            with open_document(pdf_path) as document:
                 page_sizes = [
                     PageSize(width=float(page.rect.width), height=float(page.rect.height), unit="point")
                     for page in document

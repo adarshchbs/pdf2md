@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from statistics import median
@@ -12,6 +11,7 @@ import pymupdf
 
 from app.pdf2md.canonical_table_view import canonical_table_view
 from app.pdf2md.continuations import merge_table_continuations
+from app.pdf2md.pymupdf_runtime import open_document, pymupdf_session
 from app.pdf2md.schema import (
     AnnotationMetadata,
     BoundingBox,
@@ -22,9 +22,21 @@ from app.pdf2md.schema import (
     TableCell,
     TableStructure,
 )
-from app.pdf2md.source_catalog import SourceItem, make_source_item
-from app.pdf2md.table_provenance import NativeRule, TableProvenance, TableReconstruction, reconstruct_table
-from app.pdf2md.table_quality import validate_table_candidate
+from app.pdf2md.source_catalog import (
+    SourceItem,
+    make_source_item,
+    validate_table_cell_word_provenance,
+)
+from app.pdf2md.table_provenance import (
+    NativeRule,
+    TableDiagnostic,
+    TableDiagnosticOutcome,
+    TableDiagnosticStage,
+    TableProvenance,
+    TableReconstruction,
+    reconstruct_table,
+)
+from app.pdf2md.table_quality import normalize_table_text, validate_table_candidate
 from app.pdf2md.tables import TableFeatures, classify_table, render_table
 
 _MAX_BOUNDARY_TOLERANCE = 0.5
@@ -60,8 +72,10 @@ def extract_document_table_elements(
     *,
     pages: list[int] | None = None,
     annotator: str = "pymupdf",
+    source_items: list[SourceItem] | None = None,
+    diagnostics: list[TableDiagnostic] | None = None,
 ) -> list[DocumentElement]:
-    with pymupdf.open(pdf_path) as document:
+    with open_document(pdf_path) as document:
         selected_pages = pages or list(range(1, document.page_count + 1))
         if selected_pages != sorted(set(selected_pages)):
             raise ValueError("pages must be sorted and unique")
@@ -77,6 +91,8 @@ def extract_document_table_elements(
                     document_id,
                     starting_order=len(elements),
                     annotator=annotator,
+                    source_items=source_items,
+                    diagnostics=diagnostics,
                 )
             )
         return merge_table_continuations(elements)
@@ -89,33 +105,79 @@ def extract_page_table_elements(
     starting_order: int = 0,
     annotator: str = "pymupdf",
     source_items: list[SourceItem] | None = None,
+    diagnostics: list[TableDiagnostic] | None = None,
 ) -> list[DocumentElement]:
-    view = canonical_table_view(page, document_id=document_id if source_items is not None else None)
+    with pymupdf_session():
+        return _extract_page_table_elements(
+            page,
+            document_id,
+            starting_order=starting_order,
+            annotator=annotator,
+            source_items=source_items,
+            diagnostics=diagnostics,
+        )
+
+
+def _extract_page_table_elements(
+    page: pymupdf.Page,
+    document_id: str,
+    *,
+    starting_order: int,
+    annotator: str,
+    source_items: list[SourceItem] | None,
+    diagnostics: list[TableDiagnostic] | None,
+) -> list[DocumentElement]:
+    detection_diagnostics: list[TableDiagnostic] = []
+    view = canonical_table_view(
+        page,
+        document_id=document_id if source_items is not None else None,
+        diagnostics=detection_diagnostics,
+    )
+    if diagnostics is not None:
+        diagnostics.extend(detection_diagnostics)
     elements: list[DocumentElement] = []
     for canonical_table in view.tables:
         detected_table = cast(DetectedTable, canonical_table.detected)
+        table_diagnostics: list[TableDiagnostic] = []
         structure = table_structure_from_pymupdf(
             detected_table,
             view.page_number,
             page_width=view.page_width,
             page_height=view.page_height,
             output_bbox=canonical_table.output_bbox,
+            diagnostics=table_diagnostics,
         )
-        if not validate_table_candidate(
+        quality = validate_table_candidate(
             structure,
             nearby_text=canonical_table.nearby_text,
-        ).accepted:
-            continue
-        table_number = len(elements) + 1
+        )
+        table_diagnostics.append(quality.diagnostic)
         raw_evidence = getattr(detected_table, "provenance", None)
         evidence = raw_evidence if isinstance(raw_evidence, TableProvenance) else None
-        if source_items is not None and evidence is not None:
-            _append_table_source_items(
+        if quality.accepted and source_items is not None:
+            if evidence is not None:
+                _append_table_source_items(
+                    source_items,
+                    evidence,
+                    document_id=document_id,
+                    page_number=view.page_number,
+                )
+            grounding = _table_cell_grounding_diagnostic(
+                structure,
                 source_items,
-                evidence,
                 document_id=document_id,
                 page_number=view.page_number,
             )
+            table_diagnostics.append(grounding)
+        if diagnostics is not None:
+            diagnostics.extend(table_diagnostics)
+        if not quality.accepted or (
+            source_items is not None
+            and table_diagnostics[-1].stage is TableDiagnosticStage.CONSUMPTION_SAFETY
+            and table_diagnostics[-1].outcome is TableDiagnosticOutcome.REJECTED
+        ):
+            continue
+        table_number = len(elements) + 1
         reconstructed_bbox = reconstruct_table(detected_table, evidence).bbox
         elements.append(
             DocumentElement(
@@ -136,7 +198,13 @@ def extract_page_table_elements(
                 ],
                 structure=ElementStructure(
                     table=structure,
-                    properties=_table_structural_support(evidence),
+                    properties=_table_structural_support(
+                        evidence,
+                        diagnostics=(
+                            *(evidence.diagnostics if evidence is not None else ()),
+                            *table_diagnostics,
+                        ),
+                    ),
                 ),
                 annotation=AnnotationMetadata(
                     stage="candidate",
@@ -157,11 +225,14 @@ def table_structure_from_pymupdf(
     page_width: float | None = None,
     page_height: float | None = None,
     output_bbox: Callable[[Sequence[float]], Sequence[float]] | None = None,
+    diagnostics: list[TableDiagnostic] | None = None,
 ) -> TableStructure:
     map_output_bbox = output_bbox or _identity_bbox
     raw_evidence = getattr(detected_table, "provenance", None)
     evidence = raw_evidence if isinstance(raw_evidence, TableProvenance) else None
     reconstruction = reconstruct_table(detected_table, evidence)
+    if diagnostics is not None:
+        diagnostics.extend(reconstruction.diagnostics)
     table_bbox = reconstruction.bbox
     table_width = table_bbox[2] - table_bbox[0]
     table_height = table_bbox[3] - table_bbox[1]
@@ -177,6 +248,12 @@ def table_structure_from_pymupdf(
     cells = _remove_container_cells(raw_cells)
     if not cells:
         raise ValueError("PyMuPDF table has no cells")
+    finder_cells = _remove_container_cells([
+        bbox
+        for bbox in dict.fromkeys(reconstruction.finder_cells)
+        if bbox[2] - bbox[0] > epsilon and bbox[3] - bbox[1] > epsilon
+    ])
+    finder_span_signatures = _geometry_span_signatures(finder_cells)
 
     extracted_text: dict[tuple[float, float, float, float], str] = {}
     logical_positions: dict[tuple[float, float, float, float], tuple[int, int, int]] = {}
@@ -193,7 +270,12 @@ def table_structure_from_pymupdf(
     x_boundaries = _cluster_boundaries(x_values, x_tolerance)
     y_boundaries = _cluster_boundaries(y_values, y_tolerance)
 
-    cell_source_ids = _assign_cell_source_ids(cells, extracted_text, evidence)
+    cell_source_ids = _assign_cell_source_ids(
+        cells,
+        extracted_text,
+        evidence,
+        diagnostics=diagnostics,
+    )
     table_cells: list[TableCell] = []
     for bbox in cells:
         if reconstruction.logical_grid_indices:
@@ -264,10 +346,61 @@ def table_structure_from_pymupdf(
         header_row_count=header_row_count,
         cells=table_cells,
     )
+    if diagnostics is not None:
+        final_span_signatures = {
+            (cell.row_index, cell.column_index, cell.rowspan, cell.colspan)
+            for cell in table_cells
+            if cell.rowspan > 1 or cell.colspan > 1
+        }
+        preserved_span_count = len(finder_span_signatures.intersection(final_span_signatures))
+        created_span_count = len(final_span_signatures - finder_span_signatures)
+        removed_span_count = len(finder_span_signatures - final_span_signatures)
+        diagnostics.append(
+            TableDiagnostic(
+                stage=TableDiagnosticStage.SPAN_RECONSTRUCTION,
+                outcome=(
+                    TableDiagnosticOutcome.APPLIED
+                    if created_span_count or removed_span_count
+                    else TableDiagnosticOutcome.UNCHANGED
+                ),
+                reason=(
+                    "post_finder_stages_changed_spans"
+                    if created_span_count and removed_span_count
+                    else "post_finder_stages_created_spans"
+                    if created_span_count
+                    else "post_finder_stages_removed_spans"
+                    if removed_span_count
+                    else "finder_spans_preserved"
+                    if final_span_signatures
+                    else "no_spans"
+                ),
+                metrics=(
+                    ("created_spans", created_span_count),
+                    ("finder_spanning_cells", len(finder_span_signatures)),
+                    ("preserved_spans", preserved_span_count),
+                    ("removed_spans", removed_span_count),
+                    ("spanning_cells", len(final_span_signatures)),
+                ),
+            )
+        )
     representation, reasons = classify_table(features)
     if geometry_ambiguous:
         representation = "html"
         reasons = [*reasons, "geometry_ambiguous"]
+    if diagnostics is not None:
+        diagnostics.append(
+            TableDiagnostic(
+                stage=TableDiagnosticStage.RENDERING_CLASSIFICATION,
+                outcome=TableDiagnosticOutcome.ACCEPTED,
+                reason=",".join(reasons) or representation,
+                metrics=(
+                    ("column_count", column_count),
+                    ("header_row_count", header_row_count),
+                    ("representation", representation),
+                    ("row_count", row_count),
+                ),
+            )
+        )
     return TableStructure(
         row_count=row_count,
         column_count=column_count,
@@ -687,6 +820,30 @@ def _contains_bbox(
     )
 
 
+def _geometry_span_signatures(
+    cells: Sequence[tuple[float, float, float, float]],
+) -> set[tuple[int, int, int, int]]:
+    if not cells:
+        return set()
+    x_values = [value for cell in cells for value in (cell[0], cell[2])]
+    y_values = [value for cell in cells for value in (cell[1], cell[3])]
+    x_tolerance = _boundary_tolerance(x_values)
+    y_tolerance = _boundary_tolerance(y_values)
+    x_boundaries = _cluster_boundaries(x_values, x_tolerance)
+    y_boundaries = _cluster_boundaries(y_values, y_tolerance)
+    signatures: set[tuple[int, int, int, int]] = set()
+    for cell in cells:
+        row_start = _boundary_index(y_boundaries, cell[1], y_tolerance)
+        row_end = _boundary_index(y_boundaries, cell[3], y_tolerance)
+        column_start = _boundary_index(x_boundaries, cell[0], x_tolerance)
+        column_end = _boundary_index(x_boundaries, cell[2], x_tolerance)
+        rowspan = row_end - row_start
+        colspan = column_end - column_start
+        if rowspan > 1 or colspan > 1:
+            signatures.add((row_start, column_start, rowspan, colspan))
+    return signatures
+
+
 def _boundary_tolerance(values: list[float]) -> float:
     distinct = sorted(set(values))
     positive_gaps = [
@@ -738,10 +895,11 @@ def _append_table_source_items(
             document_id=document_id,
             page_number=page_number,
             kind="word",
-            coordinate_frame="detector_page",
-            coordinates=token.bbox,
+            coordinate_frame="source_page",
+            coordinates=token.canonical_bbox or token.bbox,
             canonical_coordinates=token.canonical_bbox or token.bbox,
             text=token.text,
+            duplicate_index=token.duplicate_index,
         )
         for token in evidence.native_tokens
     )
@@ -755,13 +913,14 @@ def _append_table_source_items(
             coordinates=(rule.x0, rule.y, rule.x1, rule.y),
             canonical_coordinates=rule.canonical_geometry or (rule.x0, rule.y, rule.x1, rule.y),
             text=None,
+            duplicate_index=rule.duplicate_index,
         )
         for rule in evidence.native_rules
     )
 
 
 def _normalized_provenance_text(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = normalize_table_text(value).casefold()
     return " ".join(re.findall(r"\w+|[^\w\s]", normalized))
 
 
@@ -777,9 +936,13 @@ def _assign_cell_source_ids(
     cells: Sequence[tuple[float, float, float, float]],
     extracted_text: dict[tuple[float, float, float, float], str],
     evidence: TableProvenance | None,
+    *,
+    diagnostics: list[TableDiagnostic] | None = None,
 ) -> dict[tuple[float, float, float, float], tuple[str, ...]]:
     """Assign each native word to at most one independently supported nonempty cell."""
     if evidence is None:
+        if diagnostics is not None:
+            diagnostics.append(_cell_assignment_diagnostic({}, native_token_count=0))
         return {}
     assignments: dict[tuple[float, float, float, float], list[str]] = {}
     nonempty_cells = tuple(bbox for bbox in cells if extracted_text.get(bbox, "").strip())
@@ -812,22 +975,135 @@ def _assign_cell_source_ids(
             # A boundary tie is not positive evidence for either logical cell.
             continue
         assignments.setdefault(best[2], []).append(token.token_id.value)
-    return {bbox: tuple(dict.fromkeys(ids)) for bbox, ids in assignments.items()}
+    result = {bbox: tuple(dict.fromkeys(ids)) for bbox, ids in assignments.items()}
+    if diagnostics is not None:
+        diagnostics.append(
+            _cell_assignment_diagnostic(result, native_token_count=len(evidence.native_tokens))
+        )
+    return result
 
 
-def _table_structural_support(evidence: TableProvenance | None) -> list[StructureProperty]:
-    if evidence is None or not evidence.native_rule_ids:
-        return []
-    return [
+def _cell_assignment_diagnostic(
+    assignments: dict[tuple[float, float, float, float], tuple[str, ...]],
+    *,
+    native_token_count: int,
+) -> TableDiagnostic:
+    assigned_source_count = sum(len(source_ids) for source_ids in assignments.values())
+    return TableDiagnostic(
+        stage=TableDiagnosticStage.CELL_ASSIGNMENT,
+        outcome=(
+            TableDiagnosticOutcome.APPLIED if assigned_source_count else TableDiagnosticOutcome.UNCHANGED
+        ),
+        reason="exclusive_text_compatible",
+        metrics=(
+            ("assigned_cells", len(assignments)),
+            ("assigned_source_items", assigned_source_count),
+            ("native_tokens", native_token_count),
+        ),
+    )
+
+
+def _table_cell_grounding_diagnostic(
+    structure: TableStructure,
+    source_items: Sequence[SourceItem],
+    *,
+    document_id: str,
+    page_number: int,
+) -> TableDiagnostic:
+    """Fail closed when a populated native table cell lacks exclusive word evidence."""
+    by_id = {item.source_item_id: item for item in source_items}
+    populated_cells = [cell for cell in structure.cells if normalize_table_text(cell.text)]
+    cited: list[str] = []
+    reasons: set[str] = set()
+    grounded_cells = 0
+    for cell in structure.cells:
+        cell_ids = [source_id for fragment in cell.fragments for source_id in fragment.source_item_ids]
+        cited.extend(cell_ids)
+        try:
+            validate_table_cell_word_provenance(cell, by_id, document_id=document_id)
+        except ValueError as error:
+            detail = str(error)
+            if "require native word" in detail:
+                reasons.add("missing_cell_word_ids")
+            elif "dangling" in detail:
+                reasons.add("dangling_cell_word_id")
+            elif "reference native words" in detail:
+                reasons.add("wrong_cell_source_kind")
+            elif "source_page" in detail:
+                reasons.add("wrong_cell_source_frame")
+            elif "document mismatch" in detail:
+                reasons.add("wrong_cell_source_document")
+            elif "page mismatch" in detail:
+                reasons.add("wrong_cell_source_page")
+            elif "geometry" in detail or "page dimensions" in detail:
+                reasons.add("wrong_cell_source_geometry")
+            elif "unique" in detail:
+                reasons.add("nonexclusive_cell_word_ids")
+            elif "ambiguous" in detail:
+                reasons.add("ambiguous_cell_word_order")
+            elif "reconstruct complete" in detail:
+                reasons.add("incomplete_cell_text_grounding")
+            elif "empty table cells" in detail:
+                reasons.add("empty_cell_has_word_ids")
+            else:
+                raise
+        else:
+            grounded_cells += int(bool(normalize_table_text(cell.text)))
+    if len(cited) != len(set(cited)):
+        reasons.add("nonexclusive_cell_word_ids")
+    for source_id in cited:
+        item = by_id.get(source_id)
+        if item is not None and item.id_scheme != "native-content-v1":
+            reasons.add("nonnative_cell_word_id")
+    accepted = not reasons
+    return TableDiagnostic(
+        stage=TableDiagnosticStage.CONSUMPTION_SAFETY,
+        outcome=(TableDiagnosticOutcome.ACCEPTED if accepted else TableDiagnosticOutcome.REJECTED),
+        reason="grounded_exclusive_native_words" if accepted else ",".join(sorted(reasons)),
+        metrics=(
+            ("cited_word_ids", len(cited)),
+            ("grounded_cells", grounded_cells),
+            ("populated_cells", len(populated_cells)),
+        ),
+    )
+
+
+def _table_structural_support(
+    evidence: TableProvenance | None,
+    *,
+    diagnostics: Sequence[TableDiagnostic] = (),
+) -> list[StructureProperty]:
+    properties: list[StructureProperty] = []
+    if evidence is not None and evidence.native_rule_ids:
+        properties.append(
+            StructureProperty(
+                key="table_structural_source_item_ids",
+                value=json.dumps(
+                    sorted(rule_id.value for rule_id in evidence.native_rule_ids),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    properties.extend(
         StructureProperty(
-            key="table_structural_source_item_ids",
+            key="table_diagnostic_v1",
             value=json.dumps(
-                sorted(rule_id.value for rule_id in evidence.native_rule_ids),
+                {
+                    "metrics": {name: value for name, value in diagnostic.metrics},
+                    "outcome": diagnostic.outcome.value,
+                    "reason": diagnostic.reason,
+                    "stage": diagnostic.stage.value,
+                },
+                allow_nan=False,
                 ensure_ascii=True,
                 separators=(",", ":"),
+                sort_keys=True,
             ),
         )
-    ]
+        for diagnostic in diagnostics
+    )
+    return properties
 
 
 def _table_source_ids(structure: TableStructure) -> list[str]:

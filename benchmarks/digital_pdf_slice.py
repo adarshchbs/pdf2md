@@ -6,6 +6,8 @@ from typing import cast
 
 import pymupdf
 
+from app.pdf2md.pymupdf_runtime import open_document
+
 
 @dataclass(frozen=True)
 class DigitalSliceConfig:
@@ -64,7 +66,7 @@ def classify_pdf(
     if not pdf_path.is_file():
         raise FileNotFoundError(pdf_path)
 
-    with pymupdf.open(pdf_path) as document:
+    with open_document(pdf_path) as document:
         if document.needs_pass:
             return DigitalPdfClassification(
                 eligible=False,
@@ -91,10 +93,7 @@ def classify_document_evidence(
     )
     if any(
         page.has_glyphless_font
-        or (
-            page.invisible_text_ratio >= 0.9
-            and page.image_coverage >= config.scanned_image_coverage
-        )
+        or (page.invisible_text_ratio >= 0.9 and page.image_coverage >= config.scanned_image_coverage)
         for page in immutable_pages
     ):
         return DigitalPdfClassification(
@@ -145,12 +144,7 @@ def _page_evidence(page: pymupdf.Page) -> PageEvidence:
             bbox = pymupdf.Rect(image["bbox"]) & page.rect
             if not bbox.is_empty:
                 covered_area += float(bbox.width * bbox.height)
-    font_fields = (
-        value.casefold()
-        for font in page.get_fonts()
-        for value in font
-        if isinstance(value, str)
-    )
+    font_fields = (value.casefold() for font in page.get_fonts() for value in font if isinstance(value, str))
     text = cast(str, page.get_text("text")).strip()
     visible_characters = 0
     invisible_characters = 0
@@ -172,8 +166,6 @@ def _page_evidence(page: pymupdf.Page) -> PageEvidence:
         image_coverage=min(1.0, covered_area / page_area) if page_area > 0 else 0.0,
         has_glyphless_font=any("glyphlessfont" in value for value in font_fields),
         invisible_text_ratio=(
-            invisible_characters / styled_character_count
-            if styled_character_count
-            else 0.0
+            invisible_characters / styled_character_count if styled_character_count else 0.0
         ),
     )

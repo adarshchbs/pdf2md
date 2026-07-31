@@ -1,3 +1,4 @@
+import json
 import re
 from collections import Counter
 from collections.abc import Sequence
@@ -16,6 +17,7 @@ from app.pdf2md.pymupdf_tables import (
     extract_page_table_elements,
     table_structure_from_pymupdf,
 )
+from app.pdf2md.schema import DocumentElement
 from app.pdf2md.table_provenance import (
     CoordinateFrame,
     FinderProvenance,
@@ -26,6 +28,9 @@ from app.pdf2md.table_provenance import (
     NativeRuleId,
     NativeToken,
     NativeTokenId,
+    TableDiagnostic,
+    TableDiagnosticOutcome,
+    TableDiagnosticStage,
     TableProvenance,
     TableReconstruction,
     reconstruct_table,
@@ -58,6 +63,29 @@ class FakeTable:
             [None, "2025", "2026"],
             ["North", "10", "12"],
         ]
+
+
+def _assert_native_word_centers_are_structurally_covered(
+    pdf_path: Path,
+    page_number: int,
+    elements: Sequence[DocumentElement],
+) -> None:
+    fragment_bboxes = [
+        fragment.bbox
+        for element in elements
+        for fragment in element.fragments
+        if fragment.page_number == page_number
+    ]
+    assert fragment_bboxes
+    with pymupdf.open(pdf_path) as document:
+        words = cast(Sequence[Sequence[object]], document[page_number - 1].get_text("words", sort=True))
+    for word in words:
+        assert len(word) >= 5
+        center_x = (float(str(word[0])) + float(str(word[2]))) / 2
+        center_y = (float(str(word[1])) + float(str(word[3]))) / 2
+        assert any(
+            bbox.x0 <= center_x <= bbox.x1 and bbox.y0 <= center_y <= bbox.y1 for bbox in fragment_bboxes
+        ), word
 
 
 def test_cell_provenance_is_exclusive_text_compatible_and_excludes_rules_and_empty_cells() -> None:
@@ -106,9 +134,21 @@ def test_cell_provenance_is_exclusive_text_compatible_and_excludes_rules_and_emp
         native_rules=(rule,),
     )
 
-    assigned = _assign_cell_source_ids(cells, {cells[0]: "Alpha", cells[1]: ""}, evidence)
+    diagnostics = []
+    assigned = _assign_cell_source_ids(
+        cells,
+        {cells[0]: "Alpha", cells[1]: ""},
+        evidence,
+        diagnostics=diagnostics,
+    )
 
     assert assigned == {cells[0]: ("alpha",)}
+    assert len(diagnostics) == 1
+    assert diagnostics[0].stage == TableDiagnosticStage.CELL_ASSIGNMENT
+    assert diagnostics[0].outcome == TableDiagnosticOutcome.APPLIED
+    assert diagnostics[0].metric("assigned_cells") == 1
+    assert diagnostics[0].metric("assigned_source_items") == 1
+    assert diagnostics[0].metric("native_tokens") == 4
     cited = [source_id for ids in assigned.values() for source_id in ids]
     assert len(cited) == len(set(cited))
     properties = _table_structural_support(evidence)
@@ -117,7 +157,8 @@ def test_cell_provenance_is_exclusive_text_compatible_and_excludes_rules_and_emp
 
 
 def test_pymupdf_merged_cells_become_spans() -> None:
-    table = table_structure_from_pymupdf(FakeTable(), page_number=2)
+    diagnostics = []
+    table = table_structure_from_pymupdf(FakeTable(), page_number=2, diagnostics=diagnostics)
 
     assert table.header_row_count == 2
     assert table.representation == "html"
@@ -127,6 +168,18 @@ def test_pymupdf_merged_cells_become_spans() -> None:
     assert next(cell for cell in table.cells if cell.text == "North").role == "row_header"
     assert all(fragment.page_number == 2 for cell in table.cells for fragment in cell.fragments)
     assert render_table(table).startswith("<table><thead>")
+    assert [record.stage for record in diagnostics[-3:]] == [
+        TableDiagnosticStage.CELL_ASSIGNMENT,
+        TableDiagnosticStage.SPAN_RECONSTRUCTION,
+        TableDiagnosticStage.RENDERING_CLASSIFICATION,
+    ]
+    assert diagnostics[-2].metric("spanning_cells") == 2
+    assert diagnostics[-2].metric("preserved_spans") == 2
+    assert diagnostics[-2].metric("created_spans") == 0
+    assert diagnostics[-2].metric("removed_spans") == 0
+    assert diagnostics[-2].outcome == TableDiagnosticOutcome.UNCHANGED
+    assert diagnostics[-2].reason == "finder_spans_preserved"
+    assert diagnostics[-1].reason == "multiple_header_rows,spanning_cells"
 
 
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
@@ -153,11 +206,24 @@ def test_pymupdf_coalesces_empty_stub_below_multilevel_header(rotation: int) -> 
         mapped = pymupdf.Rect(*bbox) * matrix
         return mapped.x0, mapped.y0, mapped.x1, mapped.y1
 
-    table = table_structure_from_pymupdf(StackedStubTable(), page_number=1, output_bbox=output_bbox)
+    diagnostics = []
+    table = table_structure_from_pymupdf(
+        StackedStubTable(), page_number=1, output_bbox=output_bbox, diagnostics=diagnostics
+    )
     country = next(cell for cell in table.cells if cell.text == "Country")
+    span_diagnostic = next(
+        record for record in diagnostics if record.stage == TableDiagnosticStage.SPAN_RECONSTRUCTION
+    )
 
     assert country.rowspan == 2
     assert len([cell for cell in table.cells if cell.column_index == 0 and cell.row_index < 2]) == 1
+    assert span_diagnostic.outcome == TableDiagnosticOutcome.APPLIED
+    assert span_diagnostic.reason == "post_finder_stages_created_spans"
+    assert span_diagnostic.metric("finder_spanning_cells") == 1
+    assert span_diagnostic.metric("preserved_spans") == 1
+    assert span_diagnostic.metric("created_spans") == 1
+    assert span_diagnostic.metric("removed_spans") == 0
+    assert span_diagnostic.metric("spanning_cells") == 2
 
 
 def test_pymupdf_external_header_does_not_invent_table_header() -> None:
@@ -415,6 +481,30 @@ def test_reconstruction_fails_fast_for_malformed_and_dangling_finder_grids() -> 
         reconstruct_table(Grid(), None)
 
 
+@pytest.mark.parametrize(
+    ("update", "error"),
+    [
+        ({"stage": "row_recovery"}, TypeError),
+        ({"outcome": "accepted"}, TypeError),
+        ({"metrics": ((1, "value"),)}, TypeError),
+        ({"metrics": (("value", object()),)}, TypeError),
+        ({"metrics": (("value", float("nan")),)}, ValueError),
+        ({"metrics": (("value", float("inf")),)}, ValueError),
+    ],
+)
+def test_table_diagnostics_reject_non_typed_or_non_json_scalar_values(
+    update: dict[str, object], error: type[Exception]
+) -> None:
+    values: dict[str, object] = {
+        "stage": TableDiagnosticStage.ROW_RECOVERY,
+        "outcome": TableDiagnosticOutcome.ACCEPTED,
+    }
+    values.update(update)
+
+    with pytest.raises(error):
+        TableDiagnostic(**values)  # type: ignore[arg-type]
+
+
 def test_reconstruction_closes_snapshot_lifetime() -> None:
     class GeometryRow:
         def __init__(self, cells: Sequence[tuple[float, float, float, float] | None]) -> None:
@@ -508,6 +598,29 @@ def test_rule_backed_inset_tracks_collapse_to_logical_grid_at_any_scale_and_tran
         (2, 0, "Beta"),
         (2, 1, "Two"),
     ]
+    strategy_records = [
+        record
+        for record in reconstruction.diagnostics
+        if record.stage == TableDiagnosticStage.RECONSTRUCTION_STRATEGY
+    ]
+    assert [(record.outcome, record.reason) for record in strategy_records] == [
+        (TableDiagnosticOutcome.REJECTED, "external_financial_header"),
+        (TableDiagnosticOutcome.REJECTED, "rule_connected_external_header"),
+        (TableDiagnosticOutcome.APPLIED, "ruled_inset_grid"),
+    ]
+    assert all(
+        record.metric("failure_reason") == "gates_not_satisfied"
+        for record in strategy_records
+        if record.outcome == TableDiagnosticOutcome.REJECTED
+    )
+    assert any(
+        record.stage == TableDiagnosticStage.ROW_RECOVERY and record.metric("after") == 3
+        for record in reconstruction.diagnostics
+    )
+    assert any(
+        record.stage == TableDiagnosticStage.COLUMN_RECOVERY and record.metric("after") == 2
+        for record in reconstruction.diagnostics
+    )
 
 
 @pytest.mark.parametrize("failure", ["missing_helper", "nonuniform_helper", "unruled"])
@@ -1137,8 +1250,8 @@ def test_multilevel_header_depth_stops_at_first_dense_numeric_body_row() -> None
 
 def test_page_extraction_rejects_empty_tables_without_id_gaps() -> None:
     class EmptyTable:
-        bbox = (0.0, 0.0, 10.0, 10.0)
-        cells = [(0.0, 0.0, 10.0, 10.0)]
+        bbox = (40.0, 40.0, 50.0, 50.0)
+        cells = [(40.0, 40.0, 50.0, 50.0)]
         header = FakeHeader(external=True, names=[])
 
         def extract(self) -> list[list[str | None]]:
@@ -1152,6 +1265,7 @@ def test_page_extraction_rejects_empty_tables_without_id_gaps() -> None:
         rotation = 0
         rotation_matrix = pymupdf.Matrix(1, 0, 0, 1, 0, 0)
         rect = pymupdf.Rect(0, 0, 100, 100)
+        cropbox = pymupdf.Rect(0, 0, 100, 100)
 
         def find_tables(self, **_kwargs: str) -> Finder:
             return Finder()
@@ -1166,11 +1280,40 @@ def test_page_extraction_rejects_empty_tables_without_id_gaps() -> None:
                 return []
             return ""
 
-    elements = extract_page_table_elements(cast(pymupdf.Page, FakePage()), "doc")
+    diagnostics = []
+    elements = extract_page_table_elements(cast(pymupdf.Page, FakePage()), "doc", diagnostics=diagnostics)
+    without_diagnostics = extract_page_table_elements(cast(pymupdf.Page, FakePage()), "doc")
 
     assert len(elements) == 1
     assert elements[0].element_id == "page-1-table-1"
     assert elements[0].order == 0
+    assert elements[0].content == without_diagnostics[0].content
+    assert without_diagnostics[0].structure.properties == elements[0].structure.properties
+    diagnostic_properties = [
+        json.loads(prop.value)
+        for prop in elements[0].structure.properties
+        if prop.key == "table_diagnostic_v1"
+    ]
+    assert diagnostic_properties
+    boundary_stages = {
+        TableDiagnosticStage.BOUNDARY_DETECTION,
+        TableDiagnosticStage.BOUNDARY_FILTER,
+        TableDiagnosticStage.BOUNDARY_DEDUPLICATION,
+    }
+    collected_boundaries = [record for record in diagnostics if record.stage in boundary_stages]
+    property_boundaries = [
+        record
+        for record in diagnostic_properties
+        if record["stage"] in {stage.value for stage in boundary_stages}
+    ]
+    assert len(collected_boundaries) == len(property_boundaries)
+    assert len(collected_boundaries) == len(set(collected_boundaries))
+    assert any(
+        record.stage == TableDiagnosticStage.TABLE_QUALITY
+        and record.outcome == TableDiagnosticOutcome.REJECTED
+        and record.reason == "empty"
+        for record in diagnostics
+    )
 
 
 def test_pymupdf_irregular_grid_uses_html() -> None:
@@ -1185,6 +1328,47 @@ def test_pymupdf_irregular_grid_uses_html() -> None:
 
     assert table.representation == "html"
     assert "incomplete_grid" in table.classification_reasons
+
+
+def test_fragmented_academic_grid_preserves_ambiguous_rule_fragments() -> None:
+    pdf_path = Path("data/corpus/candidates/technical/academic-deep-residual-learning.pdf")
+    elements = extract_document_elements(pdf_path, pages=[5])
+    tables = [element.structure.table for element in elements if element.structure.table is not None]
+
+    assert [(table.row_count, table.column_count) for table in tables] == [
+        (1, 4),
+        (5, 2),
+    ]
+    assert Counter(element.element_type for element in elements) == Counter({
+        "paragraph": 122,
+        "table": 2,
+        "caption": 3,
+        "figure": 1,
+        "footnote": 1,
+    })
+    assert Counter(
+        element.structure.paragraph.role for element in elements if element.structure.paragraph is not None
+    ) == Counter({"body": 103, "figure_text": 19, "caption": 3, "footnote": 1})
+    source_ids = [
+        source_id
+        for element in elements
+        for fragment in element.fragments
+        for source_id in fragment.source_item_ids
+    ]
+    assert source_ids and len(source_ids) == len(set(source_ids))
+    _assert_native_word_centers_are_structurally_covered(pdf_path, 5, elements)
+    preserved_text = " ".join(element.content for element in elements)
+    for text in (
+        "layer name",
+        "152-layer",
+        "conv2 x",
+        "11.3×109",
+        "Architectures for ImageNet",
+        "Training on ImageNet",
+        "Top-1 error",
+        "reducing of the training error",
+    ):
+        assert text in preserved_text
 
 
 def test_rule_backed_academic_tables_split_compressed_baselines_into_logical_rows() -> None:
@@ -1493,6 +1677,36 @@ def test_rule_partitioned_form_fails_closed_without_complete_native_support(
     assert reconstruction.extracted_rows[1][0] == "Row 1 Row 2 Row 3 Row 4 Row 5 Row 6 Row 7"
 
 
+def test_form_page_external_sentence_is_prose_and_grid_keeps_reference_shape() -> None:
+    pdf_path = Path("data/corpus/candidates/institutional/irs-form990.pdf")
+    elements = extract_document_elements(pdf_path, pages=[10])
+    tables = [element for element in elements if element.structure.table is not None]
+
+    assert Counter(element.element_type for element in elements) == Counter({"paragraph": 17, "heading": 2})
+    assert all(
+        element.structure.paragraph is not None for element in elements if element.element_type == "paragraph"
+    )
+    source_ids = [
+        source_id
+        for element in elements
+        for fragment in element.fragments
+        for source_id in fragment.source_item_ids
+    ]
+    assert source_ids and len(source_ids) == len(set(source_ids))
+    _assert_native_word_centers_are_structurally_covered(pdf_path, 10, elements)
+    assert tables == []
+    preserved = " ".join(element.content for element in elements)
+    for text in (
+        "Part IX",
+        "Statement of Functional Expenses",
+        "Check if Schedule O",
+        "Do not include amounts",
+        "1 Grants and other assistance",
+        "26 Joint costs",
+    ):
+        assert text in preserved
+
+
 def test_rule_partitioned_form_recovers_target_rows_without_splitting_vertical_section_labels() -> None:
     pdf_path = Path("data/corpus/candidates/institutional/irs-form990.pdf")
     elements = extract_document_table_elements(pdf_path, "form", pages=[9, 10, 11])
@@ -1500,8 +1714,7 @@ def test_rule_partitioned_form_recovers_target_rows_without_splitting_vertical_s
 
     assert [(table.row_count, table.column_count, table.header_row_count) for table in tables] == [
         (46, 10, 1),
-        (1, 2, 1),
-        (39, 7, 2),
+        (38, 5, 1),
         (40, 7, 1),
     ]
     revenue = tables[0]
@@ -1546,16 +1759,44 @@ def test_rule_partitioned_form_does_not_rewrite_heterogeneous_emergency_or_regul
     )
 
 
-def test_rule_partitioned_form_keeps_pregrid_heading_outside_semantic_content_merge() -> None:
+def test_rule_partitioned_form_keeps_titles_instructions_and_grid_content_separate() -> None:
     pdf_path = Path("data/corpus/candidates/institutional/irs-form990.pdf")
 
     elements = extract_document_elements(pdf_path, pages=[9, 10, 11])
-    page_elements = [element for element in elements if element.fragments[0].page_number == 11]
+    by_page = {
+        page: [element for element in elements if element.fragments[0].page_number == page]
+        for page in (9, 10, 11)
+    }
 
-    assert sum(element.element_type == "heading" for element in page_elements) == 1
-    assert not any(element.element_type == "paragraph" for element in page_elements)
-    table = next(element.structure.table for element in page_elements if element.structure.table is not None)
-    assert (table.row_count, table.column_count, table.header_row_count) == (40, 7, 1)
+    assert [(element.element_type, element.content) for element in by_page[9][:3]] == [
+        ("header", "Form 990 (2025) Page 9"),
+        ("heading", "Part VIII Statement of Revenue"),
+        (
+            "paragraph",
+            "Check if Schedule O contains a response or note to any line in this Part VIII "
+            ". . . . . . . . . . . . .",
+        ),
+    ]
+    assert [(element.element_type, element.content) for element in by_page[10][:4]] == [
+        ("header", "Form 990 (2025) Page 10"),
+        ("heading", "Part IX Statement of Functional Expenses"),
+        (
+            "paragraph",
+            "Section 501(c)(3) and 501(c)(4) organizations must complete all columns. "
+            "All other organizations must complete column (A).",
+        ),
+        (
+            "paragraph",
+            "Check if Schedule O contains a response or note to any line in this Part IX "
+            ". . . . . . . . . . . . . Do not include amounts reported on lines 6b, 7b, "
+            "8b, 9b, and 10b of Part VIII.",
+        ),
+    ]
+    assert all(by_page.values())
+    assert sum(element.element_type == "heading" for element in by_page[11]) == 1
+    retained_page_11 = [element for element in by_page[11] if element.element_type == "paragraph"]
+    assert retained_page_11
+    assert all(element.content.strip() for element in retained_page_11)
 
 
 def test_rule_partitioned_form_generalizes_to_independent_accepted_financial_form() -> None:

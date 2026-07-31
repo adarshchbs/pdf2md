@@ -2,10 +2,10 @@
 name: pdf-structure-curation
 description: Independently curate bronze PDF evidence into authoritative structure-aware silver Parquet, or adjudicate candidate/reference disagreements without contaminating the reference.
 disable-model-invocation: false
-element-schema-version: "1.0.0"
+element-schema-version: "1.2.0"
 source-catalog-schema-version: "2.0.0"
-renderer-semantics-version: "1.1.0"
-evaluator-semantics-version: "1.1.0"
+renderer-semantics-version: "1.3.0"
+evaluator-semantics-version: "1.3.0"
 ---
 
 # PDF structure curation
@@ -33,10 +33,14 @@ In later verification cycles, run the current code and compare its output with s
 The schema stores types and roles as plain strings, so silver and candidate are only comparable if both use the same closed list. Never invent new values; adding one requires a matching code change and changes this file's version identity.
 
 - `element_type`: `paragraph`, `heading`, `caption`, `footnote`, `code`, `table`, `figure`, `header`, `footer`, `note`.
-- Paragraph roles: `body`, `subtitle`, `list_item`, `figure_text`, `figure_panel_heading`; plus `heading`, `caption`, `footnote`, `code` on those element types; `running_header`, `running_footer`, `page_number` on margins; `table_continuation_marker` on `note` elements. (`list_item_continuation` is a candidate-only artifact — never write it in silver.)
+- Paragraph roles: `body`, `subtitle`, `list_item`, `figure_text`; `figure_panel_heading` on contained `heading` elements; plus `heading`, `caption`, `footnote`, `code` on those element types; `running_header`, `running_footer`, `page_number` on margins; `table_continuation_marker` on `note` elements. (`list_item_continuation` is a candidate-only artifact — never write it in silver.)
 - A document title is a `heading` with level 1. A printed page number is a `header` or `footer` element (top or bottom half of the page) with role `page_number` — there is no `page_number` element type. Do not invent roles like `document_title` or `table_caption`.
 - Every element except `table` and `figure` carries a `ParagraphStructure` with one of these roles; tables and figures leave it null.
 - Non-table elements use `format="text"` and verbatim content — no `#`, no list markers, no Markdown. Only tables use `markdown`/`html`, matching their representation.
+- `structure.style_runs` is optional evidence over that unchanged content. Each run uses deterministic half-open `[start, end)` character offsets and may record font family/size, bold, italic, underline, and strikeout. Runs are sorted and non-overlapping; omit uncertain evidence rather than guessing.
+- Underline and strikeout require a thin drawing primitive tightly bounded to the text span and positioned relative to its native baseline. Page rules, separators, missing baselines, rotated/ambiguous geometry, or oversized lines are negative evidence and must not become decorations.
+- `title_evidence`, `heading_evidence`, and `list_evidence` record explicit reasons without replacing `role`, `heading_level`, `list_depth`, or `list_label`. List labels identify markers only; infer nesting depth from supported indentation, sequence, and same-column geometry, never from marker syntax alone. Existing schema 1.0/1.1 silver may omit evidence fields and style runs; readers migrate it to current optional defaults.
+- Renderers escape source Markdown and HTML metacharacters before adding canonical heading, list, and inline-style syntax. Stored plain content and character-error evaluation remain unchanged.
 - A repeated "(continued)"-style line is a `note` with role `table_continuation_marker`, `include_in_output=false` — not table data, not a caption.
 
 ## Provenance

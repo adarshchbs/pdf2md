@@ -12,6 +12,11 @@ from app.pdf2md.pymupdf_table_detection import (
     _native_word_tokens,  # pyright: ignore[reportPrivateUsage]
     detect_page_tables,
 )
+from app.pdf2md.pymupdf_table_detection import (
+    _horizontal_rules as _detected_horizontal_rules,  # pyright: ignore[reportPrivateUsage]
+)
+from app.pdf2md.pymupdf_tables import _append_table_source_items  # pyright: ignore[reportPrivateUsage]
+from app.pdf2md.source_catalog import SourceItem, content_addressed_source_item_id
 from app.pdf2md.table_provenance import (
     CoordinateFrame,
     FinderProvenance,
@@ -19,6 +24,10 @@ from app.pdf2md.table_provenance import (
     GeometricBand,
     GeometricBandKind,
     NativeRuleId,
+    NativeToken,
+    NativeTokenId,
+    TableDiagnosticOutcome,
+    TableDiagnosticStage,
     TableProvenance,
     reconstruct_table,
 )
@@ -89,6 +98,7 @@ class FakePage:
         clipped_mixed: Sequence[DetectedTable] = (),
         drawings: Sequence[Mapping[str, object]] = (),
         blocks: Sequence[Sequence[object]] = (),
+        words: Sequence[Sequence[object]] = (),
         width: float = 600.0,
         height: float = 800.0,
         rotation_matrix: pymupdf.Matrix | None = None,
@@ -101,6 +111,7 @@ class FakePage:
         self.clipped_mixed = clipped_mixed
         self.drawings = drawings
         self.blocks = blocks
+        self.words = words
         self.calls: list[dict[str, object]] = []
 
     def find_tables(self, **kwargs: object) -> FakeFinder:
@@ -119,7 +130,7 @@ class FakePage:
     def get_text(self, option: str, *, sort: bool) -> Sequence[Sequence[object]]:
         assert sort is True
         if option == "words":
-            return []
+            return self.words
         assert option == "blocks"
         return self.blocks
 
@@ -168,6 +179,48 @@ def _fragmented_grid_rules() -> list[Mapping[str, object]]:
     ]
 
 
+@pytest.mark.parametrize(
+    "rectangle",
+    [
+        (100.0, 200.0, 100.0, 300.0),
+        (100.0, 200.0, 500.0, 200.0),
+    ],
+)
+def test_degenerate_rectangle_items_do_not_abort_detection(
+    rectangle: tuple[float, float, float, float],
+) -> None:
+    table = FakeTable((100.0, 200.0, 500.0, 300.0), "table")
+    page = FakePage(
+        default=[table],
+        drawings=[
+            {
+                "rect": rectangle,
+                "color": (0.0, 0.0, 0.0),
+                "items": [("re", rectangle, 1)],
+            }
+        ],
+    )
+
+    detected = _detect(page)
+
+    assert len(detected) == 1
+    assert detected[0].bbox == table.bbox
+    assert detected[0].extract() == table.extract()
+
+
+def test_degenerate_native_word_bbox_remains_invalid() -> None:
+    class WordPage:
+        number = 0
+        rotation_matrix = pymupdf.Matrix(1, 0, 0, 1, 0, 0)
+
+        def get_text(self, option: str, *, sort: bool) -> list[tuple[object, ...]]:
+            assert option == "words" and sort
+            return [(10.0, 20.0, 10.0, 40.0, "invalid")]
+
+    with pytest.raises(ValueError, match="native word bbox must have positive dimensions"):
+        _native_word_tokens(cast(pymupdf.Page, WordPage()))
+
+
 def test_native_ids_are_document_scoped_duplicate_stable_and_input_permutation_invariant() -> None:
     class WordPage:
         number = 0
@@ -201,6 +254,222 @@ def test_native_ids_are_document_scoped_duplicate_stable_and_input_permutation_i
     assert forward_ids.isdisjoint({token.token_id.value for token in other_document})
 
 
+def test_overprinted_in_table_word_never_downgrades_document_scoped_ids() -> None:
+    document_id = "d" * 64
+    duplicate = (140.0, 230.0, 160.0, 250.0, "7", 1, 1, 1)
+    page = FakePage(
+        default=[FakeTable((100.0, 200.0, 500.0, 300.0), "table")],
+        words=[duplicate, duplicate],
+    )
+
+    detected = detect_page_tables(cast(pymupdf.Page, page), document_id=document_id)
+
+    assert len(detected) == 1
+    evidence = getattr(detected[0], "provenance", None)
+    assert isinstance(evidence, TableProvenance)
+    assert [token.duplicate_index for token in evidence.native_tokens] == [1, 2]
+    source_items: list[SourceItem] = []
+    _append_table_source_items(
+        source_items,
+        evidence,
+        document_id=document_id,
+        page_number=1,
+    )
+    assert [item.duplicate_index for item in source_items if item.kind == "word"] == [1, 2]
+    assert all(item.id_scheme == "native-content-v1" for item in source_items)
+    assert all(item.source_item_id.startswith(f"pymupdf:d{document_id}:p000001:") for item in source_items)
+
+
+def test_table_word_source_items_use_canonical_source_page_geometry() -> None:
+    document_id = "f" * 64
+    canonical_bbox = (10.0, 20.0, 30.0, 40.0)
+    token_id = content_addressed_source_item_id(
+        document_id=document_id,
+        page_number=1,
+        kind="word",
+        canonical_coordinates=canonical_bbox,
+        text="value",
+    )
+    token = NativeToken(
+        token_id=NativeTokenId(token_id),
+        frame=CoordinateFrame.DETECTOR_PAGE,
+        bbox=(260.0, 10.0, 280.0, 30.0),
+        canonical_bbox=canonical_bbox,
+        baseline=30,
+        text="value",
+    )
+    evidence = TableProvenance(
+        finder=FinderProvenance.DEFAULT,
+        frame=CoordinateFrame.DETECTOR_PAGE,
+        native_token_ids=(token.token_id,),
+        native_tokens=(token,),
+    )
+    source_items: list[SourceItem] = []
+
+    _append_table_source_items(
+        source_items,
+        evidence,
+        document_id=document_id,
+        page_number=1,
+    )
+
+    assert len(source_items) == 1
+    assert source_items[0].coordinate_frame == "source_page"
+    assert (source_items[0].x0, source_items[0].y0, source_items[0].x1, source_items[0].y1) == canonical_bbox
+
+
+def test_duplicate_native_line_rules_preserve_multiset_ids_and_drawing_permutation() -> None:
+    document_id = "e" * 64
+    duplicate_line = ("l", (120.0, 240.0), (480.0, 240.0))
+    drawings = [
+        {
+            "rect": (120.0, 240.0, 480.0, 260.0),
+            "color": (0.0, 0.0, 0.0),
+            "items": [duplicate_line, ("l", (120.0, 260.0), (480.0, 260.0))],
+        },
+        {
+            "rect": (120.0, 240.0, 480.0, 280.0),
+            "color": (0.0, 0.0, 0.0),
+            "items": [duplicate_line, ("l", (120.0, 280.0), (480.0, 280.0))],
+        },
+    ]
+
+    def evidence_for(source_drawings: Sequence[Mapping[str, object]]) -> TableProvenance:
+        page = FakePage(
+            default=[FakeTable((100.0, 200.0, 500.0, 300.0), "table")],
+            drawings=source_drawings,
+        )
+        detected = detect_page_tables(cast(pymupdf.Page, page), document_id=document_id)
+        assert len(detected) == 1
+        evidence = getattr(detected[0], "provenance", None)
+        assert isinstance(evidence, TableProvenance)
+        return evidence
+
+    forward = evidence_for(drawings)
+    reversed_order = evidence_for(list(reversed(drawings)))
+    duplicate_rules = [
+        rule for rule in forward.native_rules if rule.canonical_geometry == (120.0, 240.0, 480.0, 240.0)
+    ]
+
+    assert [rule.duplicate_index for rule in duplicate_rules] == [1, 2]
+    assert [rule.rule_id.value.rsplit(":", 1)[-1] for rule in duplicate_rules] == ["d000001", "d000002"]
+    assert {rule.rule_id for rule in forward.native_rules} == {
+        rule.rule_id for rule in reversed_order.native_rules
+    }
+    source_items: list[SourceItem] = []
+    _append_table_source_items(
+        source_items,
+        forward,
+        document_id=document_id,
+        page_number=1,
+    )
+    duplicate_items = [
+        item
+        for item in source_items
+        if item.kind == "rule"
+        and (item.canonical_x0, item.canonical_y0, item.canonical_x1, item.canonical_y1)
+        == (120.0, 240.0, 480.0, 240.0)
+    ]
+    assert [item.duplicate_index for item in duplicate_items] == [1, 2]
+    assert all(item.id_scheme == "native-content-v1" for item in duplicate_items)
+    assert [item.source_item_id.rsplit(":", 1)[-1] for item in duplicate_items] == [
+        "d000001",
+        "d000002",
+    ]
+
+
+def test_one_zero_height_rectangle_is_one_native_rule_and_one_topology_rule() -> None:
+    document_id = "f" * 64
+    rectangle_item = ("re", (120.0, 240.0, 480.0, 240.0), 1)
+    drawings = [
+        {
+            "rect": (120.0, 240.0, 480.0, 240.0),
+            "color": (0.0, 0.0, 0.0),
+            "items": [rectangle_item],
+        }
+    ]
+    page = FakePage(
+        default=[FakeTable((100.0, 200.0, 500.0, 300.0), "table")],
+        drawings=drawings,
+    )
+
+    detected = detect_page_tables(cast(pymupdf.Page, page), document_id=document_id)
+
+    assert len(detected) == 1
+    evidence = getattr(detected[0], "provenance", None)
+    assert isinstance(evidence, TableProvenance)
+    assert len(evidence.native_rules) == 1
+    assert evidence.native_rules[0].duplicate_index == 1
+    topology_rules = _detected_horizontal_rules(drawings, 600.0, 800.0, 1)
+    assert len(topology_rules) == 1
+    source_items: list[SourceItem] = []
+    _append_table_source_items(
+        source_items,
+        evidence,
+        document_id=document_id,
+        page_number=1,
+    )
+    rule_items = [item for item in source_items if item.kind == "rule"]
+    assert len(rule_items) == 1
+    assert rule_items[0].id_scheme == "native-content-v1"
+
+
+def test_separate_identical_rectangle_items_remain_duplicate_observations() -> None:
+    document_id = "1" * 64
+    rectangle_item = ("re", (120.0, 240.0, 480.0, 240.0), 1)
+    drawings = [
+        {
+            "rect": (120.0, 240.0, 480.0, 260.0),
+            "color": (0.0, 0.0, 0.0),
+            "items": [rectangle_item, ("l", (120.0, 260.0), (480.0, 260.0))],
+        },
+        {
+            "rect": (120.0, 240.0, 480.0, 280.0),
+            "color": (0.0, 0.0, 0.0),
+            "items": [rectangle_item, ("l", (120.0, 280.0), (480.0, 280.0))],
+        },
+    ]
+
+    def evidence_for(source_drawings: Sequence[Mapping[str, object]]) -> TableProvenance:
+        page = FakePage(
+            default=[FakeTable((100.0, 200.0, 500.0, 300.0), "table")],
+            drawings=source_drawings,
+        )
+        detected = detect_page_tables(cast(pymupdf.Page, page), document_id=document_id)
+        assert len(detected) == 1
+        evidence = getattr(detected[0], "provenance", None)
+        assert isinstance(evidence, TableProvenance)
+        return evidence
+
+    forward = evidence_for(drawings)
+    reversed_order = evidence_for(list(reversed(drawings)))
+    duplicate_rules = [
+        rule for rule in forward.native_rules if rule.canonical_geometry == (120.0, 240.0, 480.0, 240.0)
+    ]
+
+    assert [rule.duplicate_index for rule in duplicate_rules] == [1, 2]
+    assert [rule.rule_id.value.rsplit(":", 1)[-1] for rule in duplicate_rules] == ["d000001", "d000002"]
+    assert {rule.rule_id for rule in forward.native_rules} == {
+        rule.rule_id for rule in reversed_order.native_rules
+    }
+    source_items: list[SourceItem] = []
+    _append_table_source_items(
+        source_items,
+        forward,
+        document_id=document_id,
+        page_number=1,
+    )
+    duplicate_items = [
+        item
+        for item in source_items
+        if item.kind == "rule"
+        and (item.canonical_x0, item.canonical_y0, item.canonical_x1, item.canonical_y1)
+        == (120.0, 240.0, 480.0, 240.0)
+    ]
+    assert [item.duplicate_index for item in duplicate_items] == [1, 2]
+    assert all(item.id_scheme == "native-content-v1" for item in duplicate_items)
+
+
 def test_native_ids_use_rotation_zero_geometry_across_quarter_turn_detection() -> None:
     document_id = "c" * 64
     document = pymupdf.open()
@@ -224,9 +493,19 @@ def test_always_collects_lines_strict_but_defaults_remain_authoritative() -> Non
     strict_only = FakeTable((100.0, 100.0, 500.0, 180.0), "strict-only")
     page = FakePage(default=[default], strict=[strict_duplicate, strict_only])
 
-    tables = _detect(page)
+    diagnostics = []
+    tables = detect_page_tables(cast(pymupdf.Page, page), diagnostics=diagnostics)
 
     _assert_snapshot(tables, default, FinderProvenance.DEFAULT)
+    strict_disposition = next(
+        record
+        for record in diagnostics
+        if record.stage == TableDiagnosticStage.BOUNDARY_DETECTION
+        and record.reason == "unused_lines_strict_candidates"
+    )
+    assert strict_disposition.outcome == TableDiagnosticOutcome.REJECTED
+    assert strict_disposition.metric("input_count") == 2
+    assert strict_disposition.metric("output_count") == 0
     assert page.calls == [
         {},
         {"vertical_strategy": "lines_strict", "horizontal_strategy": "lines_strict"},
@@ -306,8 +585,15 @@ def test_incoherent_clipped_candidate_is_not_recovered() -> None:
         clipped_text=[incoherent],
         clipped_mixed=[mixed],
     )
+    diagnostics = []
 
-    assert _detect(page) == []
+    assert detect_page_tables(cast(pymupdf.Page, page), diagnostics=diagnostics) == []
+    assert any(
+        record.stage == TableDiagnosticStage.BOUNDARY_FILTER
+        and record.outcome == TableDiagnosticOutcome.REJECTED
+        and record.reason == "recovery_consensus_failed"
+        for record in diagnostics
+    )
 
 
 def test_recovery_overlapping_authoritative_default_is_not_accumulated() -> None:
@@ -322,7 +608,20 @@ def test_recovery_overlapping_authoritative_default_is_not_accumulated() -> None
         clipped_mixed=[mixed],
     )
 
-    _assert_snapshot(_detect(page), default, FinderProvenance.DEFAULT)
+    diagnostics = []
+    _assert_snapshot(
+        detect_page_tables(cast(pymupdf.Page, page), diagnostics=diagnostics),
+        default,
+        FinderProvenance.DEFAULT,
+    )
+    assert any(
+        record.stage == TableDiagnosticStage.BOUNDARY_FILTER
+        and record.outcome == TableDiagnosticOutcome.REJECTED
+        and record.reason == "overlaps_authoritative_boundary"
+        and record.metric("input_count") == 1
+        and record.metric("output_count") == 0
+        for record in diagnostics
+    )
 
 
 def test_default_container_replaces_contained_fragment() -> None:
@@ -461,11 +760,19 @@ def test_detaches_shallow_sentence_banner_before_independently_ruled_grid(scale:
         height=800 * scale,
     )
 
-    detected = _detect(page)
+    diagnostics = []
+    detected = detect_page_tables(cast(pymupdf.Page, page), diagnostics=diagnostics)
 
     assert len(detected) == 1
     assert tuple(detected[0].bbox) == box(100, 110, 500, 180)
     assert detected[0].extract() == table.extracted_rows[1:]
+    assert any(
+        record.stage == TableDiagnosticStage.BOUNDARY_FILTER
+        and record.outcome == TableDiagnosticOutcome.APPLIED
+        and record.reason == "external_sentence_banner_detached"
+        and record.metric("affected_count") == 1
+        for record in diagnostics
+    )
 
 
 @pytest.mark.parametrize(
@@ -854,8 +1161,20 @@ def test_weak_default_is_replaced_by_containing_coherent_borderless_candidate() 
         ],
     )
     page = FakePage(default=[weak], strict=[borderless])
+    diagnostics = []
 
-    _assert_snapshot(_detect(page), borderless, FinderProvenance.BORDERLESS_TEXT)
+    _assert_snapshot(
+        detect_page_tables(cast(pymupdf.Page, page), diagnostics=diagnostics),
+        borderless,
+        FinderProvenance.BORDERLESS_TEXT,
+    )
+    assert any(
+        record.stage == TableDiagnosticStage.BOUNDARY_FILTER
+        and record.outcome == TableDiagnosticOutcome.APPLIED
+        and record.reason == "weak_default_replaced"
+        and record.metric("affected_count") == 1
+        for record in diagnostics
+    )
     assert page.calls == [
         {},
         {"vertical_strategy": "lines_strict", "horizontal_strategy": "lines_strict"},
@@ -875,8 +1194,19 @@ def test_weak_default_is_not_replaced_without_strong_containment() -> None:
         rows=[["Item", "Value"], ["A", "10"], ["B", "20"]],
     )
     page = FakePage(default=[weak], strict=[unrelated])
+    diagnostics = []
 
-    _assert_snapshot(_detect(page), weak, FinderProvenance.DEFAULT)
+    _assert_snapshot(
+        detect_page_tables(cast(pymupdf.Page, page), diagnostics=diagnostics),
+        weak,
+        FinderProvenance.DEFAULT,
+    )
+    assert any(
+        record.stage == TableDiagnosticStage.BOUNDARY_FILTER
+        and record.outcome == TableDiagnosticOutcome.REJECTED
+        and record.reason == "existing_table_retained"
+        for record in diagnostics
+    )
 
 
 def test_detector_owns_borderless_fallback_after_ruled_finders_are_empty() -> None:
@@ -886,8 +1216,23 @@ def test_detector_owns_borderless_fallback_after_ruled_finders_are_empty() -> No
         rows=[["Item", "Value"], ["A", "10"], ["B", "20"]],
     )
     page = FakePage(strict=[borderless])
+    diagnostics = []
 
-    _assert_snapshot(_detect(page), borderless, FinderProvenance.BORDERLESS_TEXT)
+    _assert_snapshot(
+        detect_page_tables(cast(pymupdf.Page, page), diagnostics=diagnostics),
+        borderless,
+        FinderProvenance.BORDERLESS_TEXT,
+    )
+    borderless_dedup = next(
+        record
+        for record in diagnostics
+        if record.stage == TableDiagnosticStage.BOUNDARY_DEDUPLICATION
+        and record.reason in {"borderless_duplicate_boundary", "no_borderless_duplicate_boundary"}
+    )
+    assert borderless_dedup.outcome == TableDiagnosticOutcome.UNCHANGED
+    assert borderless_dedup.reason == "no_borderless_duplicate_boundary"
+    assert borderless_dedup.metric("input_count") == 1
+    assert borderless_dedup.metric("output_count") == 1
     assert page.calls == [
         {},
         {"vertical_strategy": "lines_strict", "horizontal_strategy": "lines_strict"},
@@ -953,12 +1298,31 @@ def test_detection_snapshots_tables_before_later_finder_calls() -> None:
 def test_candidate_permutation_does_not_change_duplicate_selection() -> None:
     first = FakeTable((100.0, 100.0, 500.0, 200.0), "z", rows=[["Z", "2"], ["B", "2"]])
     second = FakeTable((100.0, 100.0, 500.0, 200.0), "a", rows=[["A", "1"], ["B", "1"]])
+    forward_diagnostics = []
+    reverse_diagnostics = []
 
-    forward = _detect(FakePage(default=[first, second]))
-    reverse = _detect(FakePage(default=[second, first]))
+    forward = detect_page_tables(
+        cast(pymupdf.Page, FakePage(default=[first, second])), diagnostics=forward_diagnostics
+    )
+    reverse = detect_page_tables(
+        cast(pymupdf.Page, FakePage(default=[second, first])), diagnostics=reverse_diagnostics
+    )
 
     assert forward[0].extract() == reverse[0].extract() == second.extract()
     assert getattr(forward[0], "finder_provenance") == FinderProvenance.DEFAULT
+    assert forward_diagnostics == reverse_diagnostics
+    assert any(
+        record.stage == TableDiagnosticStage.BOUNDARY_DEDUPLICATION
+        and record.outcome == TableDiagnosticOutcome.REJECTED
+        and record.reason == "default_duplicate_boundary"
+        for record in forward_diagnostics
+    )
+    evidence = getattr(forward[0], "provenance")
+    assert any(
+        record.stage == TableDiagnosticStage.BOUNDARY_DETECTION
+        and record.outcome == TableDiagnosticOutcome.ACCEPTED
+        for record in evidence.diagnostics
+    )
 
 
 def test_provenance_rejects_nonfinite_duplicate_and_dangling_evidence() -> None:

@@ -1,0 +1,1031 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import importlib.metadata
+import inspect
+import json
+import math
+import os
+import secrets
+import stat
+import unicodedata
+from collections import Counter
+from pathlib import Path
+from typing import cast
+
+import numpy as np
+from pydantic import JsonValue
+from rapidfuzz.distance import Levenshtein
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.model_selection import LeaveOneGroupOut
+
+from app.pdf2md.evaluation import ElementAlignment, evaluate_document
+from app.pdf2md.schema import SCHEMA_VERSION, DocumentElement, read_document_elements
+
+BUNDLE_SCHEMA_VERSION = "blind-review-v5.0.0"
+ALGORITHM_VERSION = "independent-semantic-materiality-v5.0.0"
+NORMALIZATION_VERSION = "neutral-adjudicable-evidence-v5.0.0"
+ATTACK_VERSION = "pinned-audit-leakage-suite-v5.0.0"
+REVIEWER_FILES = frozenset({"packets.json", "audit-sample-manifest.json", "manifest.json"})
+PROTECTED_FILES = frozenset({"source-map.json", "seed.json", "full-ledger.json"})
+
+MATERIALITY_THRESHOLDS: dict[str, JsonValue] = {
+    "presence_minimum_non_whitespace_characters": 2,
+    "character_normalized_edit_distance": 0.01,
+    "geometry_region_change": "different cell in a neutral 3_by_3 page grid",
+    "qualifying_categories": [
+        "element_presence",
+        "declared_type",
+        "semantic_role",
+        "semantic_structure",
+        "table_content_topology",
+        "text_content",
+        "reading_order_segmentation",
+        "material_geometry",
+    ],
+    "category_union_rule": "any qualifying category is material; text equality cannot veto another category",
+}
+ATTACK_THRESHOLDS: dict[str, float] = {
+    "overall_mapping_recovery": 0.75,
+    "paired_mapping_recovery": 0.75,
+    "sampled_presence_origin_recovery": 0.75,
+    "public_id_nibble_recovery": 0.75,
+    "public_hash_nibble_recovery": 0.75,
+}
+
+
+def build_blind_v5(
+    candidate_dir: Path,
+    deterministic_candidate_dir: Path,
+    reference_dir: Path,
+    bronze_dir: Path,
+    reviewer_dir: Path,
+    protected_dir: Path,
+    *,
+    root_dir: Path,
+    seed: bytes | None = None,
+) -> None:
+    """Build a transactional v5 human-audit sample and protected full ledger."""
+    for path in (candidate_dir, deterministic_candidate_dir, reference_dir, bronze_dir, root_dir):
+        validate_blind_path(path, must_exist=True)
+    for path in (reviewer_dir, protected_dir):
+        validate_blind_path(path, must_exist=False)
+    _validate_disjoint_outputs(reviewer_dir, protected_dir)
+    if reviewer_dir.exists() or protected_dir.exists():
+        existing = reviewer_dir if reviewer_dir.exists() else protected_dir
+        raise FileExistsError(f"output already exists: {existing}")
+
+    secret_seed = seed if seed is not None else secrets.token_bytes(32)
+    if len(secret_seed) < 32:
+        raise ValueError("protected assignment seed must contain at least 256 bits")
+
+    candidate_paths = sorted(candidate_dir.glob("*.parquet"))
+    if not candidate_paths:
+        raise ValueError("candidate directory contains no Parquet documents")
+    names = {path.name for path in candidate_paths}
+    if names != {path.name for path in deterministic_candidate_dir.glob("*.parquet")}:
+        raise ValueError("determinism candidate file sets differ")
+    if names != {path.name for path in reference_dir.glob("*.parquet")}:
+        raise ValueError("candidate and reference file sets differ")
+
+    input_hashes: dict[str, str] = {}
+    raw: list[dict[str, object]] = []
+    for candidate_path in candidate_paths:
+        rerun_path = deterministic_candidate_dir / candidate_path.name
+        reference_path = reference_dir / candidate_path.name
+        for path in (candidate_path, rerun_path, reference_path):
+            validate_blind_path(path, must_exist=True)
+            input_hashes[_relative_path(path, root_dir)] = _sha256(path.read_bytes())
+        if candidate_path.read_bytes() != rerun_path.read_bytes():
+            raise ValueError(f"candidate is not byte-equal to determinism rerun: {candidate_path.name}")
+        raw.extend(
+            _recompute_document_disagreements(
+                candidate_path.stem,
+                read_document_elements(candidate_path),
+                read_document_elements(reference_path),
+                bronze_dir,
+                root_dir,
+            )
+        )
+
+    material = [record for record in raw if record["material"] is True]
+    nonmaterial = [record for record in raw if record["material"] is False]
+    if len(raw) != len(material) + len(nonmaterial):
+        raise RuntimeError("every recomputed record must be classified exactly once")
+    if not material:
+        raise ValueError("semantic thresholds selected no material disagreements")
+
+    full_packets, mappings = _build_packets(material, secret_seed)
+    sample_packets, sample_mappings = _reviewer_sample(full_packets, mappings, secret_seed)
+    for packet in sample_packets:
+        for relative in _evidence_paths(packet):
+            evidence_path = root_dir / relative
+            validate_blind_path(evidence_path, must_exist=True)
+            input_hashes.setdefault(relative, _sha256(evidence_path.read_bytes()))
+
+    attacks = _run_adversarial_acceptance(sample_packets, sample_mappings)
+    if attacks["result"] != "passed":
+        raise ValueError(f"pinned adversarial acceptance failed: {json.dumps(attacks, sort_keys=True)}")
+
+    packet_bytes = _pretty_bytes(sample_packets)
+    audit = _audit_manifest(full_packets, sample_packets, sample_mappings)
+    audit_bytes = _pretty_bytes(audit)
+    mode_counts = Counter(cast(str, packet["mode"]) for packet in full_packets)
+    category_counts = Counter(
+        category for packet in full_packets for category in cast(list[str], packet["categories"])
+    )
+    exclusion_counts = Counter(cast(str, record["exclusion_reason"]) for record in nonmaterial)
+    pins = _implementation_pins()
+    manifest = cast(
+        dict[str, JsonValue],
+        {
+            "artifact_id": "semantic13-human-audit-v5",
+            "scope": "non_holdout",
+            "state": "pending_human_review",
+            "human_review_performed": False,
+            "golden_promotion_performed": False,
+            "reviewer_packet_count": len(sample_packets),
+            "protected_material_population": len(full_packets),
+            "schema_versions": {
+                "document": SCHEMA_VERSION,
+                "bundle": BUNDLE_SCHEMA_VERSION,
+                "normalization": NORMALIZATION_VERSION,
+            },
+            "algorithm_versions": {
+                "selection": ALGORITHM_VERSION,
+                "adversarial_acceptance": ATTACK_VERSION,
+            },
+            "implementation_pins": pins,
+            "inputs": {
+                "candidate_directory": _relative_path(candidate_dir, root_dir),
+                "determinism_candidate_directory": _relative_path(deterministic_candidate_dir, root_dir),
+                "reference_directory": _relative_path(reference_dir, root_dir),
+                "bronze_directory": _relative_path(bronze_dir, root_dir),
+                "sha256": dict(sorted(input_hashes.items())),
+                "candidate_determinism": "byte_equal",
+            },
+            "selection": {
+                "selector": "independent evaluator recomputation from candidate and reference Parquet",
+                "policy": "all semantic-threshold disagreements enter protected material; reviewer gets only secret sample",
+                "materiality_thresholds": MATERIALITY_THRESHOLDS,
+                "raw_record_count": len(raw),
+                "material_record_count": len(material),
+                "nonmaterial_record_count": len(nonmaterial),
+                "exclusion_reason_counts": dict(sorted(exclusion_counts.items())),
+                "protected_full_ledger": "full-ledger.json",
+            },
+            "adjudication_modes": {
+                "paired_ab": "secret-HMAC A/B with prefer_a, prefer_b, equivalent, or reconstruct",
+                "presence": "neutral observed-element decision: keep, remove, or reconstruct",
+                "counts": dict(sorted(mode_counts.items())),
+            },
+            "normalization": {
+                "geometry": "coarse normalized 3_by_3 page regions",
+                "type_role_structure": "standardized and origin-neutral",
+                "table": "standardized dimensions, header count, cell-role counts, and span topology",
+                "identifiers_provenance": "omitted from reviewer options",
+            },
+            "sampling": audit["sampling"],
+            "category_counts": dict(sorted(category_counts.items())),
+            "adversarial_acceptance": attacks,
+            "reviewer_export_files": sorted(REVIEWER_FILES),
+            "protected_files": sorted(PROTECTED_FILES),
+            "separation": {
+                "filesystem_permissions": "protected directory 0700 and files 0600",
+                "reviewer_population": "secret-selected audit sample only",
+                "protected_population": "complete raw/material/nonmaterial ledger and source mapping",
+                "hmac_domains": ["packet-id", "paired-option-position", "sample-order"],
+            },
+            "sha256": {
+                "packets.json": _sha256(packet_bytes),
+                "audit-sample-manifest.json": _sha256(audit_bytes),
+            },
+            "validation": {
+                "reviewer_source_map_absent": "passed",
+                "holdout": "not_inspected",
+                "layout_model": "not_used",
+                "human_review": "not_performed",
+                "promotion": "not_performed",
+                "atomic_staged_publication": "passed",
+            },
+        },
+    )
+    manifest_bytes = _pretty_bytes(manifest)
+    source_map = {
+        "artifact_id": "semantic13-protected-source-map-v5",
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "reviewer_sha256": {
+            "packets.json": _sha256(packet_bytes),
+            "audit-sample-manifest.json": _sha256(audit_bytes),
+            "manifest.json": _sha256(manifest_bytes),
+        },
+        "sample_mappings": sample_mappings,
+        "full_material_mappings": mappings,
+    }
+    seed_record = {
+        "artifact_id": "semantic13-protected-seed-v5",
+        "encoding": "hex",
+        "bits": len(secret_seed) * 8,
+        "value": secret_seed.hex(),
+        "hmac": "HMAC-SHA256",
+        "domains": ["packet-id", "paired-option-position", "sample-order"],
+    }
+    full_ledger = {
+        "artifact_id": "semantic13-protected-full-ledger-v5",
+        "policy": "every independently recomputed aligned and one-sided record",
+        "thresholds": MATERIALITY_THRESHOLDS,
+        "counts": {"raw": len(raw), "material": len(material), "nonmaterial": len(nonmaterial)},
+        "records": [
+            _ledger_record(record)
+            for record in sorted(raw, key=lambda value: cast(str, value["neutral_key"]))
+        ],
+    }
+    _stage_and_publish(
+        reviewer_dir,
+        protected_dir,
+        {
+            "packets.json": packet_bytes,
+            "audit-sample-manifest.json": audit_bytes,
+            "manifest.json": manifest_bytes,
+        },
+        {
+            "source-map.json": _pretty_bytes(source_map),
+            "seed.json": _pretty_bytes(seed_record),
+            "full-ledger.json": _pretty_bytes(full_ledger),
+        },
+    )
+
+
+def read_protected_seed(path: Path) -> bytes:
+    validate_blind_path(path, must_exist=True)
+    value = json.loads(path.read_bytes())
+    if not isinstance(value, dict) or not isinstance(value.get("value"), str):
+        raise TypeError("protected seed file requires a hexadecimal value")
+    seed = bytes.fromhex(value["value"])
+    if len(seed) < 32:
+        raise ValueError("protected seed must contain at least 256 bits")
+    return seed
+
+
+def canonical_review_option(element: DocumentElement | None) -> dict[str, JsonValue] | None:
+    return _canonical_option(element)
+
+
+def material_categories(
+    candidate: DocumentElement | None, reference: DocumentElement | None, *, order_issue: bool = False
+) -> list[str]:
+    """Return every independently qualifying semantic materiality category."""
+    return _material_categories(candidate, reference, order_issue)
+
+
+def validate_blind_path(path: Path, *, must_exist: bool) -> None:
+    resolved = path.resolve(strict=must_exist)
+    for inspected in (path.absolute(), resolved):
+        lowered = [part.lower() for part in inspected.parts]
+        if any("holdout" in part for part in lowered):
+            raise ValueError(f"holdout path is forbidden: {path}")
+        if any("layoutlm" in part for part in lowered):
+            raise ValueError(f"LayoutLM path is forbidden: {path}")
+
+
+def _recompute_document_disagreements(
+    document: str,
+    candidates: list[DocumentElement],
+    references: list[DocumentElement],
+    bronze_dir: Path,
+    root_dir: Path,
+) -> list[dict[str, object]]:
+    report = evaluate_document(candidates, references)
+    inversions = _inversion_participants(report.alignments)
+    values: list[dict[str, object]] = []
+    for alignment in report.alignments:
+        values.append(
+            _disagreement(
+                document,
+                candidates[alignment.candidate_index],
+                references[alignment.reference_index],
+                alignment.candidate_index,
+                alignment.reference_index,
+                alignment.score,
+                (alignment.candidate_index, alignment.reference_index) in inversions,
+                bronze_dir,
+                root_dir,
+            )
+        )
+    for index in report.unmatched_candidate_indices:
+        values.append(
+            _disagreement(document, candidates[index], None, index, None, 0.0, False, bronze_dir, root_dir)
+        )
+    for index in report.unmatched_reference_indices:
+        values.append(
+            _disagreement(document, None, references[index], None, index, 0.0, False, bronze_dir, root_dir)
+        )
+    return values
+
+
+def _disagreement(
+    document: str,
+    candidate: DocumentElement | None,
+    reference: DocumentElement | None,
+    candidate_index: int | None,
+    reference_index: int | None,
+    alignment_score: float,
+    order_issue: bool,
+    bronze_dir: Path,
+    root_dir: Path,
+) -> dict[str, object]:
+    if candidate is None and reference is None:
+        raise ValueError("disagreement requires at least one source element")
+    categories = _material_categories(candidate, reference, order_issue)
+    reason = _exclusion_reason(candidate, reference, categories)
+    element = candidate or reference
+    assert element is not None
+    pages = sorted({
+        fragment.page_number for item in (candidate, reference) if item for fragment in item.fragments
+    })
+    neutral_key = _neutral_key(document, candidate_index, reference_index, candidate, reference)
+    bronze_relative = _relative_path(bronze_dir, root_dir)
+    evidence = {
+        "bronze_manifest": f"{bronze_relative}/{document}/manifest.json",
+        "bronze_native_json": f"{bronze_relative}/{document}/liteparse.json",
+        "bronze_native_text": f"{bronze_relative}/{document}/liteparse.txt",
+        "page_images": [f"{bronze_relative}/{document}/pages/page-{page:04d}.png" for page in pages],
+    }
+    return {
+        "neutral_key": neutral_key,
+        "document": document,
+        "document_id": element.document_id,
+        "mode": "presence" if candidate is None or reference is None else "paired_ab",
+        "candidate_index": candidate_index,
+        "reference_index": reference_index,
+        "candidate_element_id": candidate.element_id if candidate else None,
+        "reference_element_id": reference.element_id if reference else None,
+        "candidate_option": _canonical_option(candidate),
+        "reference_option": _canonical_option(reference),
+        "page_numbers": pages,
+        "evidence": evidence,
+        "categories": categories,
+        "severity": _severity(categories),
+        "alignment_score": alignment_score,
+        "material": reason is None,
+        "exclusion_reason": reason,
+        "presence_origin": "candidate" if reference is None else "reference" if candidate is None else None,
+    }
+
+
+def _canonical_option(element: DocumentElement | None) -> dict[str, JsonValue] | None:
+    if element is None:
+        return None
+    paragraph = element.structure.paragraph
+    role: dict[str, JsonValue] = {
+        "paragraph_role": _normalized_label(paragraph.role) if paragraph else None,
+        "heading_level": paragraph.heading_level if paragraph else None,
+        "list_depth": paragraph.list_depth if paragraph else None,
+        "footnote": element.structure.footnote is not None,
+    }
+    structure: dict[str, JsonValue] = {
+        "line_patterns": cast(JsonValue, _visible_structure(element.content)),
+        "table": _table_summary(element),
+        "fragment_count": len(element.fragments),
+        "page_count": len(_fragment_pages(element)),
+    }
+    return cast(
+        dict[str, JsonValue],
+        {
+            "kind": "document_element",
+            "text": _text(element.content),
+            "declared_type": _review_element_class(element),
+            "role": role,
+            "geometry": _region_payload(element),
+            "structure": structure,
+        },
+    )
+
+
+def _table_summary(element: DocumentElement) -> dict[str, JsonValue] | None:
+    table = element.structure.table
+    if table is None:
+        return None
+    roles = Counter(cell.role for cell in table.cells)
+    spans = Counter(f"{cell.rowspan}x{cell.colspan}" for cell in table.cells)
+    return {
+        "row_count": table.row_count,
+        "column_count": table.column_count,
+        "header_row_count": table.header_row_count,
+        "representation": table.representation,
+        "cell_role_counts": dict(sorted(roles.items())),
+        "span_counts": dict(sorted(spans.items())),
+    }
+
+
+def _review_element_class(element: DocumentElement) -> str:
+    value = _normalized_label(element.element_type)
+    aliases = {
+        "image": "figure",
+        "picture": "figure",
+        "header": "running_matter",
+        "footer": "running_matter",
+        "text": "paragraph",
+        "body": "paragraph",
+    }
+    return aliases.get(value, value)
+
+
+def _normalized_label(value: str) -> str:
+    return _text(value).lower().replace("-", "_").replace(" ", "_")
+
+
+def _page_region(fragment: object) -> dict[str, JsonValue]:
+    bbox = getattr(fragment, "bbox")
+    width = getattr(fragment, "page_width") or max(float(getattr(bbox, "x1")), 1.0)
+    height = getattr(fragment, "page_height") or max(float(getattr(bbox, "y1")), 1.0)
+    center_x = (float(getattr(bbox, "x0")) + float(getattr(bbox, "x1"))) / (2 * width)
+    center_y = (float(getattr(bbox, "y0")) + float(getattr(bbox, "y1"))) / (2 * height)
+    horizontal = ("left", "center", "right")[min(2, max(0, int(center_x * 3)))]
+    vertical = ("top", "middle", "bottom")[min(2, max(0, int(center_y * 3)))]
+    return {"page": getattr(fragment, "page_number"), "horizontal": horizontal, "vertical": vertical}
+
+
+def _material_categories(
+    candidate: DocumentElement | None, reference: DocumentElement | None, order_issue: bool
+) -> list[str]:
+    if candidate is None or reference is None:
+        element = candidate or reference
+        if element is None:
+            return []
+        if len(_text(element.content).strip()) >= 2 or element.element_type in {"table", "figure"}:
+            return ["element_presence"]
+        return []
+    categories: list[str] = []
+    if _review_element_class(candidate) != _review_element_class(reference):
+        categories.append("declared_type")
+    if _role_payload(candidate) != _role_payload(reference):
+        categories.append("semantic_role")
+    if _visible_structure(candidate.content) != _visible_structure(reference.content):
+        categories.append("semantic_structure")
+    if _table_summary(candidate) != _table_summary(reference):
+        categories.append("table_content_topology")
+    if _text_material(candidate.content, reference.content):
+        categories.append("text_content")
+    if (
+        order_issue
+        or candidate.order != reference.order
+        or _fragment_pages(candidate) != _fragment_pages(reference)
+    ):
+        categories.append("reading_order_segmentation")
+    if _region_payload(candidate) != _region_payload(reference):
+        categories.append("material_geometry")
+    return sorted(set(categories))
+
+
+def _role_payload(element: DocumentElement) -> JsonValue:
+    paragraph = element.structure.paragraph
+    return cast(
+        JsonValue,
+        {
+            "paragraph_role": _normalized_label(paragraph.role) if paragraph else None,
+            "heading_level": paragraph.heading_level if paragraph else None,
+            "list_depth": paragraph.list_depth if paragraph else None,
+            "footnote": element.structure.footnote is not None,
+        },
+    )
+
+
+def _visible_structure(value: str) -> list[str]:
+    signatures: list[str] = []
+    for line in _text(value).splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            signatures.append("heading_marker")
+        elif stripped.startswith(("- ", "* ", "+ ")):
+            signatures.append("bullet_marker")
+        elif stripped[:1].isdigit() and ". " in stripped[:6]:
+            signatures.append("numbered_marker")
+        elif stripped.startswith("|") and stripped.endswith("|"):
+            signatures.append("table_row_marker")
+        else:
+            signatures.append("plain_line")
+    return signatures
+
+
+def _region_payload(element: DocumentElement) -> JsonValue:
+    return cast(JsonValue, [_page_region(fragment) for fragment in element.fragments])
+
+
+def _text_material(left: str, right: str) -> bool:
+    left_text, right_text = _text(left), _text(right)
+    if left_text == right_text:
+        return False
+    distance = Levenshtein.distance(left_text, right_text)
+    return distance / max(len(left_text), len(right_text), 1) >= 0.01
+
+
+def _exclusion_reason(
+    candidate: DocumentElement | None, reference: DocumentElement | None, categories: list[str]
+) -> str | None:
+    if categories:
+        return None
+    if candidate is None or reference is None:
+        return "nonmaterial_presence_below_minimum_content"
+    return "below_all_semantic_thresholds"
+
+
+def _severity(categories: list[str]) -> str:
+    values = set(categories)
+    if values & {"element_presence", "table_content_topology"}:
+        return "critical"
+    if values & {"declared_type", "semantic_role", "semantic_structure", "reading_order_segmentation"}:
+        return "high"
+    if "text_content" in values:
+        return "medium"
+    return "low"
+
+
+def _build_packets(
+    material: list[dict[str, object]], seed: bytes
+) -> tuple[list[dict[str, JsonValue]], list[dict[str, JsonValue]]]:
+    packets: list[dict[str, JsonValue]] = []
+    mappings: list[dict[str, JsonValue]] = []
+    for record in material:
+        neutral_key = cast(str, record["neutral_key"])
+        packet_id = _secret_token(seed, "packet-id", neutral_key, length=24)
+        common: dict[str, JsonValue] = {
+            "packet_id": packet_id,
+            "document": cast(str, record["document"]),
+            "mode": cast(str, record["mode"]),
+            "page_numbers": cast(JsonValue, record["page_numbers"]),
+            "evidence": cast(JsonValue, record["evidence"]),
+            "categories": cast(JsonValue, record["categories"]),
+            "severity": cast(str, record["severity"]),
+            "review_state": "pending_human_review",
+        }
+        if record["mode"] == "paired_ab":
+            candidate_first = _secret_bit(seed, "paired-option-position", neutral_key) == 0
+            candidate_option = cast(JsonValue, record["candidate_option"])
+            reference_option = cast(JsonValue, record["reference_option"])
+            option_a, option_b = (
+                (candidate_option, reference_option)
+                if candidate_first
+                else (reference_option, candidate_option)
+            )
+            packet = {
+                **common,
+                "prompt": "Which option should define the adjudicated element?",
+                "option_a": option_a,
+                "option_b": option_b,
+                "allowed_decisions": ["prefer_a", "prefer_b", "equivalent", "reconstruct"],
+            }
+            mapping = {
+                "packet_id": packet_id,
+                "neutral_key": neutral_key,
+                "mode": "paired_ab",
+                "source_a": "candidate" if candidate_first else "reference",
+                "source_b": "reference" if candidate_first else "candidate",
+            }
+        else:
+            observed = record["candidate_option"] or record["reference_option"]
+            packet = {
+                **common,
+                "prompt": "How should this observed element be handled?",
+                "observed_element": cast(JsonValue, observed),
+                "allowed_decisions": ["keep", "remove", "reconstruct"],
+            }
+            mapping = {
+                "packet_id": packet_id,
+                "neutral_key": neutral_key,
+                "mode": "presence",
+                "presence_origin": cast(str, record["presence_origin"]),
+            }
+        mappings.append({
+            **mapping,
+            "document": cast(str, record["document"]),
+            "candidate_index": cast(JsonValue, record["candidate_index"]),
+            "reference_index": cast(JsonValue, record["reference_index"]),
+            "candidate_element_id": cast(JsonValue, record["candidate_element_id"]),
+            "reference_element_id": cast(JsonValue, record["reference_element_id"]),
+        })
+        packets.append(cast(dict[str, JsonValue], packet))
+    packets.sort(key=lambda value: cast(str, value["packet_id"]))
+    mappings.sort(key=lambda value: cast(str, value["packet_id"]))
+    return packets, mappings
+
+
+def _reviewer_sample(
+    packets: list[dict[str, JsonValue]], mappings: list[dict[str, JsonValue]], seed: bytes
+) -> tuple[list[dict[str, JsonValue]], list[dict[str, JsonValue]]]:
+    target = max(math.ceil(len(packets) * 0.01), math.floor(len(packets) * 0.02))
+    if not (0.01 <= target / len(packets) <= 0.02):
+        raise ValueError("population cannot support an integer 1-2% reviewer sample")
+    if target < 4:
+        raise ValueError("1-2% sample cannot support paired plus balanced presence auditing")
+    mapping_by_id = {cast(str, mapping["packet_id"]): mapping for mapping in mappings}
+
+    def ordered(values: list[dict[str, JsonValue]]) -> list[dict[str, JsonValue]]:
+        return sorted(
+            values,
+            key=lambda packet: _secret_token(seed, "sample-order", cast(str, packet["packet_id"]), length=64),
+        )
+
+    candidate_presence = ordered([
+        packet
+        for packet in packets
+        if packet["mode"] == "presence"
+        and mapping_by_id[cast(str, packet["packet_id"])]["presence_origin"] == "candidate"
+    ])
+    reference_presence = ordered([
+        packet
+        for packet in packets
+        if packet["mode"] == "presence"
+        and mapping_by_id[cast(str, packet["packet_id"])]["presence_origin"] == "reference"
+    ])
+    paired_candidate_a = ordered([
+        packet
+        for packet in packets
+        if packet["mode"] == "paired_ab"
+        and mapping_by_id[cast(str, packet["packet_id"])]["source_a"] == "candidate"
+    ])
+    paired_reference_a = ordered([
+        packet
+        for packet in packets
+        if packet["mode"] == "paired_ab"
+        and mapping_by_id[cast(str, packet["packet_id"])]["source_a"] == "reference"
+    ])
+    presence_each = min(len(candidate_presence), len(reference_presence), 1)
+    paired_count = target - 2 * presence_each
+    if presence_each == 0 or paired_count < 2 or paired_count % 2:
+        raise ValueError("sample cannot include paired records with exactly balanced presence origins")
+    paired_each = paired_count // 2
+    if len(paired_candidate_a) < paired_each or len(paired_reference_a) < paired_each:
+        raise ValueError("sample cannot balance secret paired HMAC assignments")
+    selected = (
+        candidate_presence[:presence_each]
+        + reference_presence[:presence_each]
+        + paired_candidate_a[:paired_each]
+        + paired_reference_a[:paired_each]
+    )
+    selected.sort(key=lambda packet: cast(str, packet["packet_id"]))
+    selected_ids = {cast(str, packet["packet_id"]) for packet in selected}
+    sample_mappings = [mapping for mapping in mappings if mapping["packet_id"] in selected_ids]
+    origins = Counter(
+        cast(str, mapping["presence_origin"]) for mapping in sample_mappings if mapping["mode"] == "presence"
+    )
+    if origins["candidate"] != origins["reference"] or not origins["candidate"]:
+        raise RuntimeError("sampled presence origins are not exactly balanced")
+    return selected, sample_mappings
+
+
+def _run_adversarial_acceptance(
+    packets: list[dict[str, JsonValue]], mappings: list[dict[str, JsonValue]]
+) -> dict[str, JsonValue]:
+    mapping_by_id = {cast(str, mapping["packet_id"]): mapping for mapping in mappings}
+    expected = np.asarray([_mapping_label(packet, mapping_by_id) for packet in packets], dtype=bool)
+    groups = np.asarray([cast(str, packet["document"]) for packet in packets])
+    if len(set(groups.tolist())) < 2 or len(set(expected.tolist())) < 2:
+        raise ValueError("leakage attacks require multiple documents and both protected mapping labels")
+    feature_sets = {
+        "public_id_nibbles": [_public_id_nibble_features(packet) for packet in packets],
+        "public_hash_nibbles": [_public_hash_nibble_features(packet) for packet in packets],
+        "structural_content": [_structural_content_features(packet) for packet in packets],
+    }
+    models = {
+        "random_forest": RandomForestClassifier(
+            n_estimators=300, max_depth=5, min_samples_leaf=2, random_state=5105, n_jobs=1
+        ),
+        "extra_trees": ExtraTreesClassifier(
+            n_estimators=300, max_depth=5, min_samples_leaf=2, random_state=5105, n_jobs=1
+        ),
+    }
+    results: dict[str, JsonValue] = {}
+    all_metrics: list[dict[str, float]] = []
+    for feature_name, features in feature_sets.items():
+        matrix = cast(np.ndarray, DictVectorizer(sparse=False).fit_transform(features))
+        for model_name, model in models.items():
+            predictions = _lodo_predictions(matrix, expected, groups, model)
+            metrics = _attack_metrics(packets, expected, predictions)
+            results[f"{feature_name}_{model_name}"] = cast(JsonValue, metrics)
+            all_metrics.append(metrics)
+    worst = {
+        key: max(metric[key] for metric in all_metrics)
+        for key in (
+            "overall_mapping_recovery",
+            "paired_mapping_recovery",
+            "sampled_presence_origin_recovery",
+        )
+    }
+    public_id = max(metric["overall_mapping_recovery"] for metric in all_metrics[:2])
+    public_hash = max(metric["overall_mapping_recovery"] for metric in all_metrics[2:4])
+    public = {
+        "public_id_nibble_recovery": public_id,
+        "public_hash_nibble_recovery": public_hash,
+    }
+    passed = all(worst[key] <= ATTACK_THRESHOLDS[key] for key in worst) and all(
+        public[key] <= ATTACK_THRESHOLDS[key] for key in public
+    )
+    return cast(
+        dict[str, JsonValue],
+        {
+            "method": "full public ID/hash nibble and standardized structural/content LODO RF/ExtraTrees",
+            "population": {
+                "reviewer_packets": len(packets),
+                "paired": sum(packet["mode"] == "paired_ab" for packet in packets),
+                "presence": sum(packet["mode"] == "presence" for packet in packets),
+                "excluded": 0,
+            },
+            "models": results,
+            "worst_recovery": worst,
+            "public_attacks": public,
+            "raw_recovery_policy": "acceptance uses raw out-of-document recovery; no balanced substitute or post-hoc inversion",
+            "thresholds": ATTACK_THRESHOLDS,
+            "result": "passed" if passed else "failed",
+        },
+    )
+
+
+def _lodo_predictions(
+    matrix: np.ndarray,
+    expected: np.ndarray,
+    groups: np.ndarray,
+    model: RandomForestClassifier | ExtraTreesClassifier,
+) -> np.ndarray:
+    predictions = np.zeros(len(expected), dtype=bool)
+    for train, test in LeaveOneGroupOut().split(matrix, expected, groups):
+        train_labels = expected[train]
+        if len(set(train_labels.tolist())) == 1:
+            predictions[test] = train_labels[0]
+        else:
+            model.fit(matrix[train], train_labels)
+            predictions[test] = cast(np.ndarray, model.predict(matrix[test]))
+    return predictions
+
+
+def _attack_metrics(
+    packets: list[dict[str, JsonValue]], expected: np.ndarray, predicted: np.ndarray
+) -> dict[str, float]:
+    paired = np.asarray([packet["mode"] == "paired_ab" for packet in packets])
+    presence = ~paired
+    if not paired.any() or not presence.any():
+        raise ValueError("attacks require paired and presence sample records")
+
+    def scores(mask: np.ndarray) -> tuple[float, float]:
+        raw = float(np.mean(expected[mask] == predicted[mask]))
+        return raw, raw
+
+    raw_all, recovery_all = scores(np.ones(len(packets), dtype=bool))
+    raw_paired, recovery_paired = scores(paired)
+    raw_presence, recovery_presence = scores(presence)
+    return {
+        "raw_mapping_accuracy": raw_all,
+        "overall_mapping_recovery": recovery_all,
+        "raw_paired_mapping_accuracy": raw_paired,
+        "paired_mapping_recovery": recovery_paired,
+        "raw_sampled_presence_origin_accuracy": raw_presence,
+        "sampled_presence_origin_recovery": recovery_presence,
+    }
+
+
+def _mapping_label(packet: dict[str, JsonValue], mapping_by_id: dict[str, dict[str, JsonValue]]) -> bool:
+    mapping = mapping_by_id[cast(str, packet["packet_id"])]
+    if packet["mode"] == "paired_ab":
+        return mapping["source_a"] == "candidate"
+    return mapping["presence_origin"] == "candidate"
+
+
+def _public_id_nibble_features(packet: dict[str, JsonValue]) -> dict[str, float]:
+    packet_id = cast(str, packet["packet_id"])
+    return {f"nibble_{index}": float(int(value, 16)) for index, value in enumerate(packet_id)}
+
+
+def _public_hash_nibble_features(packet: dict[str, JsonValue]) -> dict[str, float]:
+    packet_hash = hashlib.sha256(_canonical_bytes(packet)).hexdigest()
+    return {f"nibble_{index}": float(int(value, 16)) for index, value in enumerate(packet_hash)}
+
+
+def _structural_content_features(packet: dict[str, JsonValue]) -> dict[str, float | str | bool]:
+    options = [
+        value
+        for key in ("option_a", "option_b", "observed_element")
+        if isinstance((value := packet.get(key)), dict)
+    ]
+    texts = [cast(str, option["text"]) for option in options]
+    return {
+        "mode": cast(str, packet["mode"]),
+        "severity": cast(str, packet["severity"]),
+        "categories": "|".join(sorted(cast(list[str], packet["categories"]))),
+        "types": "|".join(cast(str, option["declared_type"]) for option in options),
+        "text_lengths": "|".join(str(len(text)) for text in texts),
+        "digit_counts": "|".join(str(sum(character.isdigit() for character in text)) for text in texts),
+        "structure": "|".join(
+            hashlib.sha256(_canonical_bytes(option["structure"])).hexdigest()[:8] for option in options
+        ),
+        "geometry": "|".join(
+            hashlib.sha256(_canonical_bytes(option["geometry"])).hexdigest()[:8] for option in options
+        ),
+    }
+
+
+def _audit_manifest(
+    population: list[dict[str, JsonValue]],
+    selected: list[dict[str, JsonValue]],
+    mappings: list[dict[str, JsonValue]],
+) -> dict[str, JsonValue]:
+    mapping_by_id = {cast(str, mapping["packet_id"]): mapping for mapping in mappings}
+    origins = Counter(
+        cast(str, mapping["presence_origin"]) for mapping in mappings if mapping["mode"] == "presence"
+    )
+    return cast(
+        dict[str, JsonValue],
+        {
+            "artifact_id": "semantic13-secret-human-audit-sample-v5",
+            "state": "pending_human_review",
+            "review_performed": False,
+            "promotion_performed": False,
+            "sampling": {
+                "method": "secret-HMAC order without replacement; paired included; protected presence origins exactly balanced",
+                "population": len(population),
+                "selected_unique_disagreements": len(selected),
+                "realized_rate": len(selected) / len(population),
+                "actual_coverage": {
+                    "documents": sorted({cast(str, packet["document"]) for packet in selected}),
+                    "severities": sorted({cast(str, packet["severity"]) for packet in selected}),
+                    "categories": sorted({
+                        category for packet in selected for category in cast(list[str], packet["categories"])
+                    }),
+                    "modes": sorted({cast(str, packet["mode"]) for packet in selected}),
+                    "presence_count": sum(packet["mode"] == "presence" for packet in selected),
+                    "paired_count": sum(packet["mode"] == "paired_ab" for packet in selected),
+                },
+                "coverage_declaration": "only listed actual coverage is claimed",
+                "protected_balance_assertion": origins["candidate"] == origins["reference"] > 0,
+            },
+            "sample": [
+                {
+                    "packet_id": packet["packet_id"],
+                    "packet_sha256": _sha256(_canonical_bytes(packet)),
+                    "review_state": "pending_human_review",
+                }
+                for packet in selected
+                if cast(str, packet["packet_id"]) in mapping_by_id
+            ],
+        },
+    )
+
+
+def _ledger_record(value: dict[str, object]) -> dict[str, JsonValue]:
+    return cast(
+        dict[str, JsonValue],
+        {
+            "record_id": _sha256(cast(str, value["neutral_key"]).encode())[:24],
+            "neutral_key": value["neutral_key"],
+            "document": value["document"],
+            "mode": value["mode"],
+            "candidate_index": value["candidate_index"],
+            "reference_index": value["reference_index"],
+            "candidate_element_id": value["candidate_element_id"],
+            "reference_element_id": value["reference_element_id"],
+            "presence_origin": value["presence_origin"],
+            "categories": value["categories"],
+            "material": value["material"],
+            "exclusion_reason": value["exclusion_reason"],
+            "alignment_score": value["alignment_score"],
+            "candidate_option": value["candidate_option"],
+            "reference_option": value["reference_option"],
+            "evidence": value["evidence"],
+        },
+    )
+
+
+def _implementation_pins() -> dict[str, JsonValue]:
+    return {
+        "evaluation_function_sha256": _sha256(inspect.getsource(evaluate_document).encode()),
+        "selection_function_sha256": _sha256(inspect.getsource(_material_categories).encode()),
+        "packages": {
+            name: importlib.metadata.version(name)
+            for name in ("numpy", "pydantic", "rapidfuzz", "scikit-learn")
+        },
+    }
+
+
+def _stage_and_publish(
+    reviewer_dir: Path,
+    protected_dir: Path,
+    reviewer_files: dict[str, bytes],
+    protected_files: dict[str, bytes],
+) -> None:
+    reviewer_dir.parent.mkdir(parents=True, exist_ok=True)
+    protected_dir.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_hex(12)
+    reviewer_stage = reviewer_dir.with_name(f".{reviewer_dir.name}.v5-stage-{token}")
+    protected_stage = protected_dir.with_name(f".{protected_dir.name}.v5-stage-{token}")
+    if reviewer_stage.exists() or protected_stage.exists():
+        raise FileExistsError("atomic staging path already exists")
+    reviewer_stage.mkdir()
+    protected_stage.mkdir(mode=0o700)
+    os.chmod(protected_stage, 0o700)
+    for name, content in reviewer_files.items():
+        (reviewer_stage / name).write_bytes(content)
+    for name, content in protected_files.items():
+        path = protected_stage / name
+        path.write_bytes(content)
+        os.chmod(path, 0o600)
+    _verify_exports(reviewer_stage, protected_stage)
+    os.replace(reviewer_stage, reviewer_dir)
+    try:
+        os.replace(protected_stage, protected_dir)
+    except OSError:
+        os.replace(reviewer_dir, reviewer_stage)
+        raise
+    _verify_exports(reviewer_dir, protected_dir)
+
+
+def _evidence_paths(packet: dict[str, JsonValue]) -> list[str]:
+    evidence = packet["evidence"]
+    if not isinstance(evidence, dict):
+        raise TypeError("packet evidence must be an object")
+    values = [value for value in evidence.values() if isinstance(value, str)]
+    images = evidence.get("page_images")
+    if not isinstance(images, list) or any(not isinstance(value, str) for value in images):
+        raise TypeError("page image evidence must be a list of strings")
+    return values + cast(list[str], images)
+
+
+def _verify_exports(reviewer_dir: Path, protected_dir: Path) -> None:
+    if {path.name for path in reviewer_dir.iterdir()} != set(REVIEWER_FILES):
+        raise RuntimeError("reviewer bundle must contain exactly three declared files")
+    if {path.name for path in protected_dir.iterdir()} != set(PROTECTED_FILES):
+        raise RuntimeError("protected directory contains unexpected files")
+    if stat.S_IMODE(protected_dir.stat().st_mode) != 0o700:
+        raise PermissionError("protected directory mode is not 0700")
+    for name in PROTECTED_FILES:
+        if stat.S_IMODE((protected_dir / name).stat().st_mode) != 0o600:
+            raise PermissionError(f"protected file mode is not 0600: {name}")
+
+
+def _inversion_participants(alignments: list[ElementAlignment]) -> set[tuple[int, int]]:
+    participants: set[tuple[int, int]] = set()
+    for position, left in enumerate(alignments):
+        for right in alignments[position + 1 :]:
+            if left.candidate_index > right.candidate_index:
+                participants.add((left.candidate_index, left.reference_index))
+                participants.add((right.candidate_index, right.reference_index))
+    return participants
+
+
+def _fragment_pages(element: DocumentElement) -> set[int]:
+    return {fragment.page_number for fragment in element.fragments}
+
+
+def _neutral_key(
+    document: str,
+    candidate_index: int | None,
+    reference_index: int | None,
+    candidate: DocumentElement | None,
+    reference: DocumentElement | None,
+) -> str:
+    return _sha256(
+        _canonical_bytes({
+            "document": document,
+            "candidate_index": candidate_index,
+            "reference_index": reference_index,
+            "candidate_digest": _sha256(_canonical_bytes(_canonical_option(candidate))),
+            "reference_digest": _sha256(_canonical_bytes(_canonical_option(reference))),
+        })
+    )
+
+
+def _secret_token(seed: bytes, domain: str, value: str, *, length: int) -> str:
+    key = hmac.new(seed, f"blind-v5-key\0{domain}".encode(), hashlib.sha256).digest()
+    return hmac.new(key, value.encode(), hashlib.sha256).hexdigest()[:length]
+
+
+def _secret_bit(seed: bytes, domain: str, value: str) -> int:
+    return int(_secret_token(seed, domain, value, length=2), 16) & 1
+
+
+def _text(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value.replace("\r\n", "\n").replace("\r", "\n"))
+    return "\n".join(line.rstrip() for line in normalized.split("\n"))
+
+
+def _validate_disjoint_outputs(reviewer_dir: Path, protected_dir: Path) -> None:
+    reviewer = reviewer_dir.resolve(strict=False)
+    protected = protected_dir.resolve(strict=False)
+    if reviewer == protected or reviewer in protected.parents or protected in reviewer.parents:
+        raise ValueError("protected directory must be outside and disjoint from reviewer bundle")
+
+
+def _relative_path(path: Path, root: Path) -> str:
+    return path.resolve(strict=True).relative_to(root.resolve(strict=True)).as_posix()
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+
+
+def _pretty_bytes(value: object) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()

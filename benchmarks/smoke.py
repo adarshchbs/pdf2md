@@ -18,6 +18,7 @@ from typing import Final
 import polars as pl
 import pymupdf
 
+from app.pdf2md.pymupdf_runtime import open_document
 from benchmarks.adapters import get_adapter
 from benchmarks.canonical import CanonicalTable
 from benchmarks.metrics import Metric
@@ -121,56 +122,55 @@ def create_synthetic_pdf(path: Path) -> None:
     if path.exists():
         raise FileExistsError(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    document = pymupdf.open()
-    page = document.new_page(width=612, height=792)
-    page.insert_text((54, 68), "Offline Extraction Smoke", fontname="hebo", fontsize=18)
-    page.insert_text(
-        (54, 100),
-        "Café résumé totals: 1,234.50 USD; growth 25%.",
-        fontname="helv",
-        fontsize=11,
-    )
-    page.insert_text(
-        (54, 120),
-        "All names and values on this page are synthetic.",
-        fontname="helv",
-        fontsize=10,
-    )
+    with open_document() as document:
+        page = document.new_page(width=612, height=792)
+        page.insert_text((54, 68), "Offline Extraction Smoke", fontname="hebo", fontsize=18)
+        page.insert_text(
+            (54, 100),
+            "Café résumé totals: 1,234.50 USD; growth 25%.",
+            fontname="helv",
+            fontsize=11,
+        )
+        page.insert_text(
+            (54, 120),
+            "All names and values on this page are synthetic.",
+            fontname="helv",
+            fontsize=10,
+        )
 
-    left, top = 54.0, 160.0
-    widths = (210.0, 120.0, 120.0)
-    row_height = 34.0
-    rows = (("Item", "Units", "Price"), ("Alpha", "12", "3.50"), ("Beta", "7", "8.25"))
-    x_positions = [left]
-    for width in widths:
-        x_positions.append(x_positions[-1] + width)
-    for x in x_positions:
-        page.draw_line((x, top), (x, top + row_height * len(rows)), color=(0, 0, 0), width=1)
-    for row_index in range(len(rows) + 1):
-        y = top + row_index * row_height
-        page.draw_line((left, y), (x_positions[-1], y), color=(0, 0, 0), width=1)
-    for row_index, values in enumerate(rows):
-        for column_index, value in enumerate(values):
-            cell = pymupdf.Rect(
-                x_positions[column_index] + 6,
-                top + row_index * row_height + 4,
-                x_positions[column_index + 1] - 6,
-                top + (row_index + 1) * row_height - 4,
-            )
-            page.insert_textbox(
-                cell,
-                value,
-                fontname="hebo" if row_index == 0 else "helv",
-                fontsize=10,
-                align=pymupdf.TEXT_ALIGN_LEFT,
-            )
-    document.set_metadata({
-        "title": "Offline Extraction Smoke",
-        "author": "pdf2md development smoke harness",
-        "subject": "Synthetic fixture; no public or third-party source material",
-    })
-    document.save(path, garbage=4, deflate=True)
-    document.close()
+        left, top = 54.0, 160.0
+        widths = (210.0, 120.0, 120.0)
+        row_height = 34.0
+        rows = (("Item", "Units", "Price"), ("Alpha", "12", "3.50"), ("Beta", "7", "8.25"))
+        x_positions = [left]
+        for width in widths:
+            x_positions.append(x_positions[-1] + width)
+        for x in x_positions:
+            page.draw_line((x, top), (x, top + row_height * len(rows)), color=(0, 0, 0), width=1)
+        for row_index in range(len(rows) + 1):
+            y = top + row_index * row_height
+            page.draw_line((left, y), (x_positions[-1], y), color=(0, 0, 0), width=1)
+        for row_index, values in enumerate(rows):
+            for column_index, value in enumerate(values):
+                cell = pymupdf.Rect(
+                    x_positions[column_index] + 6,
+                    top + row_index * row_height + 4,
+                    x_positions[column_index + 1] - 6,
+                    top + (row_index + 1) * row_height - 4,
+                )
+                page.insert_textbox(
+                    cell,
+                    value,
+                    fontname="hebo" if row_index == 0 else "helv",
+                    fontsize=10,
+                    align=pymupdf.TEXT_ALIGN_LEFT,
+                )
+        document.set_metadata({
+            "title": "Offline Extraction Smoke",
+            "author": "pdf2md development smoke harness",
+            "subject": "Synthetic fixture; no public or third-party source material",
+        })
+        document.save(path, garbage=4, deflate=True)
 
 
 def run_smoke(output: Path) -> tuple[dict[str, object], list[str]]:

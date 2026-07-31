@@ -322,7 +322,7 @@ def test_hanging_indent_list_item_joins_and_preserves_list_metadata() -> None:
     )
     assert result[0].paragraph_role == "list_item"
     assert result[0].list_label == "(b)"
-    assert result[0].list_depth == 1
+    assert result[0].list_depth == 0
 
 
 def test_numbered_running_footer_is_not_classified_as_a_list_item() -> None:
@@ -369,11 +369,11 @@ def test_list_classifier_rejects_common_non_list_labels(text: str) -> None:
         (
             "1.2. Nested numeric item with explanatory content.",
             "1.2.",
-            1,
+            0,
             "Nested numeric item with explanatory content.",
         ),
-        ("(a) Parenthesized alphabetic item.", "(a)", 1, "Parenthesized alphabetic item."),
-        ("(iv) Nested parenthesized Roman item.", "(iv)", 2, "Nested parenthesized Roman item."),
+        ("(a) Parenthesized alphabetic item.", "(a)", 0, "Parenthesized alphabetic item."),
+        ("(iv) Nested parenthesized Roman item.", "(iv)", 0, "Nested parenthesized Roman item."),
     ],
 )
 def test_list_classifier_strips_supported_labels_and_assigns_depth(
@@ -385,6 +385,28 @@ def test_list_classifier_strips_supported_labels_and_assigns_depth(
     assert result[0].paragraph_role == "list_item"
     assert result[0].list_label == label
     assert result[0].list_depth == depth
+
+
+def test_list_depth_uses_indentation_sequence_geometry_not_marker_syntax() -> None:
+    top = block("1. Top-level item with explanatory content.", (40, 100, 500, 120))
+    nested = block("1.1. Nested item with explanatory content.", (75, 125, 500, 145))
+    peer = block("(iv) Peer nested item with explanatory content.", (76, 150, 500, 170))
+    outdented = block("2. Back to top-level explanatory content.", (41, 175, 500, 195))
+
+    result = join_paragraphs([top, nested, peer, outdented])
+
+    assert [item.list_depth for item in result] == [0, 1, 1, 0]
+    assert [item.list_label for item in result] == ["1.", "1.1.", "(iv)", "2."]
+
+
+def test_list_depth_fails_closed_across_pages_and_columns() -> None:
+    first = block("1. First item with explanatory content.", (40, 100, 240, 120), page=1)
+    next_page = block("(a) New page item with explanatory content.", (75, 100, 275, 120), page=2)
+    other_column = block("(i) Other column item with explanatory content.", (350, 125, 560, 145), page=2)
+
+    result = join_paragraphs([first, next_page, other_column])
+
+    assert [item.list_depth for item in result] == [0, 0, 0]
 
 
 def test_adjacent_numeric_items_are_not_joined_as_continuation_text() -> None:

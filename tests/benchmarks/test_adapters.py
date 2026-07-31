@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pymupdf
@@ -13,10 +14,11 @@ from app.pdf2md.schema import (
     ElementStructure,
     PageFragment,
     ParagraphStructure,
+    StructureProperty,
     TableCell,
     TableStructure,
 )
-from app.pdf2md.source_catalog import SourceCatalog
+from app.pdf2md.source_catalog import SourceCatalog, SourceItem, make_source_item
 from benchmarks.adapters import ADAPTER_REGISTRY, BenchmarkAdapter, get_adapter
 from benchmarks.adapters.our_parser import OurParserAdapter, project_extracted_document
 from benchmarks.adapters.pymupdf_text import PyMuPDFTextAdapter
@@ -51,12 +53,29 @@ def _draw_table_pdf(path: Path) -> None:
         document.save(path)
 
 
-def _fragment(page: int, bbox: tuple[float, float, float, float]) -> PageFragment:
+def _fragment(
+    page: int,
+    bbox: tuple[float, float, float, float],
+    *,
+    source_item_ids: tuple[str, ...] = (),
+) -> PageFragment:
     return PageFragment(
         page_number=page,
         page_width=200,
         page_height=300,
         bbox=BoundingBox(x0=bbox[0], y0=bbox[1], x1=bbox[2], y1=bbox[3]),
+        source_item_ids=list(source_item_ids),
+    )
+
+
+def _word_item(page: int, bbox: tuple[float, float, float, float], text: str) -> SourceItem:
+    return make_source_item(
+        document_id=_SHA,
+        page_number=page,
+        kind="word",
+        coordinate_frame="source_page",
+        coordinates=bbox,
+        text=text,
     )
 
 
@@ -67,6 +86,21 @@ def _annotation() -> AnnotationMetadata:
         annotator="synthetic",
         confidence=1,
         adjudication_status="unreviewed",
+    )
+
+
+def _empty_suppression_ledger(table_id: str, page_number: int) -> StructureProperty:
+    return StructureProperty(
+        key="table_span_suppression_v1",
+        value=json.dumps({
+            "counts": {"retained_overlap": 0, "supported": 0, "suppressed": 0},
+            "disposition": "no_overlap",
+            "page_number": page_number,
+            "retained_overlap_span_ids": [],
+            "supported_span_ids": [],
+            "suppressed_span_ids": [],
+            "table_id": table_id,
+        }),
     )
 
 
@@ -152,6 +186,10 @@ def test_model_projection_preserves_compact_html_spans_and_cross_page_geometry()
         '<table><thead><tr><th colspan="2">Summary</th></tr></thead>'
         "<tbody><tr><td>A</td><td>10</td></tr></tbody></table>"
     )
+    summary_word = _word_item(1, (10, 40, 190, 70), "Summary")
+    label_word = _word_item(2, (10, 20, 100, 50), "A")
+    value_word = _word_item(2, (100, 20, 190, 50), "10")
+    source_items = tuple(sorted((summary_word, label_word, value_word), key=lambda item: item.source_item_id))
     cells = [
         TableCell(
             row_index=0,
@@ -159,21 +197,39 @@ def test_model_projection_preserves_compact_html_spans_and_cross_page_geometry()
             colspan=2,
             role="header",
             text="Summary",
-            fragments=[_fragment(1, (10, 40, 190, 70))],
+            fragments=[
+                _fragment(
+                    1,
+                    (10, 40, 190, 70),
+                    source_item_ids=(summary_word.source_item_id,),
+                )
+            ],
         ),
         TableCell(
             row_index=1,
             column_index=0,
             role="body",
             text="A",
-            fragments=[_fragment(2, (10, 20, 100, 50))],
+            fragments=[
+                _fragment(
+                    2,
+                    (10, 20, 100, 50),
+                    source_item_ids=(label_word.source_item_id,),
+                )
+            ],
         ),
         TableCell(
             row_index=1,
             column_index=1,
             role="body",
             text="10",
-            fragments=[_fragment(2, (100, 20, 190, 50))],
+            fragments=[
+                _fragment(
+                    2,
+                    (100, 20, 190, 50),
+                    source_item_ids=(value_word.source_item_id,),
+                )
+            ],
         ),
     ]
     table = DocumentElement(
@@ -192,7 +248,11 @@ def test_model_projection_preserves_compact_html_spans_and_cross_page_geometry()
                 representation="html",
                 classification_reasons=["spanning_cells"],
                 cells=cells,
-            )
+            ),
+            properties=[
+                _empty_suppression_ledger("stable-table", 1),
+                _empty_suppression_ledger("stable-table", 2),
+            ],
         ),
         annotation=_annotation(),
     )
@@ -210,7 +270,7 @@ def test_model_projection_preserves_compact_html_spans_and_cross_page_geometry()
     )
     extracted = ExtractedDocument(
         elements=(table, header),
-        source_catalog=SourceCatalog(document_id=_SHA, items=()),
+        source_catalog=SourceCatalog(document_id=_SHA, items=source_items),
     )
     provenance = CanonicalProvenance(
         tool_name="synthetic",

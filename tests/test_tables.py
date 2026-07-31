@@ -1,6 +1,7 @@
 import pytest
 
 from app.pdf2md.schema import BoundingBox, PageFragment, TableCell, TableStructure
+from app.pdf2md.table_provenance import TableDiagnosticOutcome, TableDiagnosticStage
 from app.pdf2md.tables import TableFeatures, classify_table, render_table, strict_table_classification
 
 
@@ -282,6 +283,11 @@ def test_rendering_is_deterministic_for_shuffled_cell_input() -> None:
             cells=cells,
         )
     )
+    baseline_diagnostics = []
+    assert classify_table(
+        TableFeatures(row_count=2, column_count=2, header_row_count=1, cells=cells),
+        diagnostics=baseline_diagnostics,
+    ) == ("markdown", [])
 
     for ordering in (list(reversed(cells)), [cells[2], cells[0], cells[3], cells[1]]):
         table = TableStructure(
@@ -291,7 +297,15 @@ def test_rendering_is_deterministic_for_shuffled_cell_input() -> None:
             representation="markdown",
             cells=ordering,
         )
+        diagnostics = []
         assert render_table(table) == expected
+        assert classify_table(
+            TableFeatures(row_count=2, column_count=2, header_row_count=1, cells=ordering),
+            diagnostics=diagnostics,
+        ) == ("markdown", [])
+        assert diagnostics == baseline_diagnostics
+    assert baseline_diagnostics[0].stage == TableDiagnosticStage.RENDERING_CLASSIFICATION
+    assert baseline_diagnostics[0].outcome == TableDiagnosticOutcome.ACCEPTED
 
 
 def test_malformed_header_row_role_fails_schema_validation() -> None:

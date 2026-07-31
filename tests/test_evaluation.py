@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app.pdf2md.evaluation import (
@@ -171,18 +173,38 @@ def footnote(
     label: str,
     reference_element_ids: list[str],
 ) -> DocumentElement:
-    element = paragraph(element_id, content, order, 70)
-    return element.model_copy(
-        update={
-            "element_type": "footnote",
-            "structure": ElementStructure(
-                footnote=FootnoteStructure(
-                    label=label,
-                    reference_element_ids=reference_element_ids,
-                    association_confident=bool(reference_element_ids),
-                )
+    paragraph_element = paragraph(element_id, content, order, 70)
+    unique_reference_ids = list(dict.fromkeys(reference_element_ids))
+    element = DocumentElement(
+        document_id=paragraph_element.document_id,
+        element_id=paragraph_element.element_id,
+        order=paragraph_element.order,
+        element_type="footnote",
+        content=paragraph_element.content,
+        format=paragraph_element.format,
+        include_in_output=paragraph_element.include_in_output,
+        fragments=paragraph_element.fragments,
+        structure=ElementStructure(
+            paragraph=ParagraphStructure(role="footnote"),
+            footnote=FootnoteStructure(
+                label=label,
+                reference_element_ids=unique_reference_ids,
+                association_confident=bool(unique_reference_ids),
             ),
-        }
+        ),
+        annotation=paragraph_element.annotation,
+    )
+    if len(reference_element_ids) == len(unique_reference_ids):
+        return element
+
+    # Preserve only this deliberate malformed evaluator negative control.
+    malformed_footnote = FootnoteStructure.model_construct(
+        label=label,
+        reference_element_ids=reference_element_ids,
+        association_confident=True,
+    )
+    return element.model_copy(
+        update={"structure": element.structure.model_copy(update={"footnote": malformed_footnote})}
     )
 
 
@@ -236,6 +258,26 @@ def test_footnote_metrics_compare_semantics_independently_of_canonical_markdown_
             ["candidate-first", "candidate-second"],
         ),
     ])
+    marker_ranges = ((11, 15), (12, 16))
+    candidate[:2] = [
+        element.model_copy(
+            update={
+                "structure": element.structure.model_copy(
+                    update={
+                        "properties": [
+                            StructureProperty(
+                                key="inline_footnote_markers",
+                                value=(
+                                    f"[{json.dumps({'start': start, 'end': end, 'label': '1'}, sort_keys=True)}]"
+                                ),
+                            )
+                        ]
+                    }
+                )
+            }
+        )
+        for element, (start, end) in zip(candidate[:2], marker_ranges, strict=True)
+    ]
 
     report = evaluate_document(candidate, reference)
 
@@ -1833,7 +1875,11 @@ def test_identity_ignores_provenance_only_structure_properties() -> None:
                         StructureProperty(key="source_note", value="native page 1 block 2"),
                         StructureProperty(
                             key="inline_footnote_markers",
-                            value='{"marker":"a","target":"footnote-a"}',
+                            value="[]",
+                        ),
+                        StructureProperty(
+                            key="table_structural_source_item_ids",
+                            value='["pymupdf:rule"]',
                         ),
                     ]
                 }
