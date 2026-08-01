@@ -310,8 +310,8 @@
       copyPacket();
     }
   }
-  function jsonFor(x: ApiElement | undefined) {
-    return x?.element ?? null;
+  function elementEndpoint(source: 'candidate' | 'reference') {
+    return `/comparison/documents/${encodeURIComponent(documentId)}/elements/${source}`;
   }
   async function copyPacket() {
     copyError = '';
@@ -697,12 +697,24 @@
                           'font-mono text-[10px] leading-relaxed',
                         ]}>{canonicalOf(selectedCandidate)}</pre>
                     </details>
-                    <div class="mb-1 font-mono text-[9px] text-slate-500">EXACT JSON</div>
-                    <pre
+                    <div class="mb-1 font-mono text-[9px] text-slate-500">QUERY LOCATOR</div>
+                    <dl
                       class={[
-                        'overflow-auto border-l-2 border-cobalt bg-slate-50 p-2',
-                        'font-mono text-[10px] leading-relaxed',
-                      ]}>{JSON.stringify(jsonFor(selectedCandidate), null, 2)}</pre>
+                        'grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1',
+                        'border-l-2 border-cobalt bg-slate-50 p-2 font-mono text-[10px]',
+                      ]}
+                    >
+                      <dt class="text-slate-500">document</dt>
+                      <dd class="truncate" title={documentId}>{documentId}</dd>
+                      <dt class="text-slate-500">element</dt>
+                      <dd class="truncate" title={idOf(selectedCandidate)}>{idOf(selectedCandidate)}</dd>
+                      <dt class="text-slate-500">page · bbox</dt>
+                      <dd>{pageOf(selectedCandidate)} · [{formatBbox(bboxOf(selectedCandidate))}]</dd>
+                      <dt class="text-slate-500">API</dt>
+                      <dd class="truncate" title={elementEndpoint('candidate')}>
+                        {elementEndpoint('candidate')}
+                      </dd>
+                    </dl>
                   </div>
                 </section>{/if}{:else}<div
                 class="grid flex-1 place-items-center font-mono text-xs text-slate-500"
@@ -729,12 +741,6 @@
               false,
               true,
             )}{#if !collapsed.reference}{#if selectedReference}<div class="min-h-0 flex-1 overflow-auto p-3">
-                  <div class="mb-1 font-mono text-[9px] text-slate-500">EXACT JSON</div>
-                  <pre
-                    class={[
-                      'mb-4 overflow-auto border-l-2 border-teal bg-teal-50 p-2',
-                      'font-mono text-[10px] leading-relaxed',
-                    ]}>{JSON.stringify(jsonFor(selectedReference), null, 2)}</pre>
                   <div class="mb-1 font-mono text-[9px] text-slate-500">CANONICAL OUTPUT</div>
                   <div
                     class={[
@@ -754,6 +760,24 @@
                         'font-mono text-[10px] leading-relaxed',
                       ]}>{canonicalOf(selectedReference)}</pre>
                   </details>
+                  <div class="mb-1 mt-3 font-mono text-[9px] text-slate-500">QUERY LOCATOR</div>
+                  <dl
+                    class={[
+                      'grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1',
+                      'border-l-2 border-teal bg-teal-50 p-2 font-mono text-[10px]',
+                    ]}
+                  >
+                    <dt class="text-slate-500">document</dt>
+                    <dd class="truncate" title={documentId}>{documentId}</dd>
+                    <dt class="text-slate-500">element</dt>
+                    <dd class="truncate" title={idOf(selectedReference)}>{idOf(selectedReference)}</dd>
+                    <dt class="text-slate-500">page · bbox</dt>
+                    <dd>{pageOf(selectedReference)} · [{formatBbox(bboxOf(selectedReference))}]</dd>
+                    <dt class="text-slate-500">API</dt>
+                    <dd class="truncate" title={elementEndpoint('reference')}>
+                      {elementEndpoint('reference')}
+                    </dd>
+                  </dl>
                 </div>{:else}<div class="grid flex-1 place-items-center font-mono text-xs text-slate-500">
                   Select a paired element.
                 </div>{/if}{:else}<div

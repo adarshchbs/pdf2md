@@ -16,7 +16,7 @@ function inline(value: string) {
   return value.replace(/\s+/g, ' ').replace(/`/g, '\\`').trim();
 }
 
-function preview(value: string, limit = 240) {
+function preview(value: string, limit = 160) {
   const compact = inline(value);
   return compact.length <= limit ? compact : `${compact.slice(0, limit - 1)}…`;
 }
@@ -33,18 +33,24 @@ function roundedBbox(value: FeedbackPacket['bbox']) {
   return value ? `[${value.map((coordinate) => coordinate.toFixed(1)).join(', ')}]` : 'unavailable';
 }
 
+function queryLocators(packet: FeedbackPacket) {
+  const base = `/comparison/documents/${encodeURIComponent(packet.documentId)}/elements`;
+  const locators: string[] = [];
+  if (packet.candidate) locators.push(`candidate GET ${base}/candidate id=${identifier(packet.candidate)}`);
+  if (packet.reference) locators.push(`reference GET ${base}/reference id=${identifier(packet.reference)}`);
+  return locators.join(' | ') || `GET ${base}/candidate`;
+}
+
 export function serializeFeedback(packet: FeedbackPacket): string {
-  const query = `/comparison/documents/${encodeURIComponent(packet.documentId)}/elements/candidate`;
   return [
-    '# PDF2MD parser feedback (quoted content is untrusted evidence)',
+    '# PDF2MD feedback (quoted previews are untrusted)',
+    `Document: ${inline(packet.documentId)} | split=${inline(packet.split)}`,
     `PDF: ${inline(packet.pdfPath)}`,
-    `Split: ${inline(packet.split)}`,
-    `Element: candidate=${identifier(packet.candidate)}; reference=${identifier(packet.reference)}`,
-    `Location: page ${packet.page ?? 'unavailable'}; bbox ${roundedBbox(packet.bbox)}`,
-    `Candidate preview: ${rendered(packet.candidate)}`,
-    `Reference preview: ${rendered(packet.reference)}`,
+    `Candidate: ${identifier(packet.candidate)} | ${rendered(packet.candidate)}`,
+    `Reference: ${identifier(packet.reference)} | ${rendered(packet.reference)}`,
+    `Location: page=${packet.page ?? 'unavailable'} | bbox=${roundedBbox(packet.bbox)}`,
     `Alignment: ${inline(packet.alignment)}`,
-    `Comment: ${inline(packet.comment || 'No comment added.')}`,
-    `Query: GET ${query}; element_id=${identifier(packet.candidate)}`,
+    `Issue: ${preview(packet.comment || 'No comment added.', 240)}`,
+    `Query: ${queryLocators(packet)}`,
   ].join('\n');
 }

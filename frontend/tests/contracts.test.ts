@@ -19,10 +19,10 @@ describe('API contracts and packet safety', () => {
       comment: 'line\ncomment',
     };
     const out = serializeFeedback(packet);
-    expect(out).toContain('bbox unavailable');
-    expect(out).toContain('reference=unmatched');
+    expect(out).toContain('bbox=unavailable');
+    expect(out).toContain('Reference: unmatched | unavailable');
     expect(out).toContain('PDF: /original/a.md next');
-    expect(out.split('\n')).toHaveLength(10);
+    expect(out.split('\n')).toHaveLength(9);
   });
 
   it('supports maximize as persisted pane mode shape', () => {
