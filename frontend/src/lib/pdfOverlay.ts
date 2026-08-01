@@ -4,11 +4,7 @@ export type PdfViewportTransform = {
   transform: [number, number, number, number, number, number];
 };
 
-function applyTransform(
-  x: number,
-  y: number,
-  [a, b, c, d, e, f]: PdfViewportTransform['transform'],
-) {
+function applyTransform(x: number, y: number, [a, b, c, d, e, f]: PdfViewportTransform['transform']) {
   return [x * a + y * c + e, x * b + y * d + f] as const;
 }
 

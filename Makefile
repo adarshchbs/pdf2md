@@ -3,7 +3,10 @@
 
 PY_PATHS := app/pdf2md app/upload_endpoint.py app/comparison_router.py app/main.py tests
 
-.PHONY: check fmt lint type test all sync lock
+.PHONY: dev check fmt lint type test all sync lock
+
+dev:
+	./run.sh
 
 sync:
 	uv sync --all-groups

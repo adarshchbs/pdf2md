@@ -86,12 +86,16 @@ uv run pdf2md verify-bronze data/bronze/example
 
 ## API and frontend
 
-The local comparison dashboard runs on port 8010:
+Development uses Vite hot reload for the browser-facing UI and FastAPI reload for the API:
 
 ```bash
 ./run.sh
-# open http://127.0.0.1:8010
+# UI with HMR: http://127.0.0.1:5173
+# FastAPI (proxied by Vite): http://127.0.0.1:8010
 ```
+
+The split is development-only: Vite needs its own process for HMR. Production builds the frontend once
+and serves it from FastAPI on port 8010.
 
 It uses the current benchmark candidate bundle and `data/silver-cycle2` when those
 root-confined directories exist. These are non-blind candidate/reference artifacts,

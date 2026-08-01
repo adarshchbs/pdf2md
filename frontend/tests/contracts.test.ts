@@ -1,5 +1,31 @@
-import {describe,it,expect} from 'vitest';
-import {backendSplit} from '../src/lib/api';
-import {serializeFeedback,type FeedbackPacket} from '../src/lib/feedback';
-import {togglePane} from '../src/lib/paneState';
-describe('API contracts and packet safety',()=>{it('maps product test label to backend holdout',()=>expect(backendSplit('test')).toBe('holdout'));it('keeps unmatched sides null and escapes fences',()=>{const p:FeedbackPacket={pdfPath:'/original/a.md\nnext',split:'test',page:null,bbox:null,candidate:{id:'c',json:{x:'```'},rendered:'ok'},reference:null,alignment:'unmatched candidate',comment:'line\n```'};const out=serializeFeedback(p);expect(out).toContain('BBox: null');expect(out).toContain('Element: null (unmatched / unavailable)');expect(out).toContain('``\\`');});it('supports maximize as persisted pane mode shape',()=>expect(togglePane({source:true},'source').source).toBe(false))});
+import { describe, expect, it } from 'vitest';
+import { backendSplit } from '../src/lib/api';
+import { type FeedbackPacket, serializeFeedback } from '../src/lib/feedback';
+import { togglePane } from '../src/lib/paneState';
+
+describe('API contracts and packet safety', () => {
+  it('maps product test label to backend holdout', () => expect(backendSplit('test')).toBe('holdout'));
+
+  it('keeps unmatched sides compact and queryable', () => {
+    const packet: FeedbackPacket = {
+      documentId: 'doc-1',
+      pdfPath: '/original/a.md\nnext',
+      split: 'test',
+      page: null,
+      bbox: null,
+      candidate: { id: 'c', rendered: 'ok' },
+      reference: null,
+      alignment: 'unmatched candidate',
+      comment: 'line\ncomment',
+    };
+    const out = serializeFeedback(packet);
+    expect(out).toContain('bbox unavailable');
+    expect(out).toContain('reference=unmatched');
+    expect(out).toContain('PDF: /original/a.md next');
+    expect(out.split('\n')).toHaveLength(10);
+  });
+
+  it('supports maximize as persisted pane mode shape', () => {
+    expect(togglePane({ source: true }, 'source').source).toBe(false);
+  });
+});
