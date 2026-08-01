@@ -1,12 +1,12 @@
 """Copyright (C) 2022 Adarsh Gupta"""
+
 import logging
 import re
 from collections import defaultdict
-from copy import deepcopy
 from typing import Dict, List, Tuple
 
 import numpy as np
-from nptyping import NDArray
+from numpy.typing import NDArray
 
 # from pyrsistent import T
 from app.pymupdf_parser.parameter.parsed_content import Header
@@ -18,27 +18,19 @@ from app.pymupdf_parser.utils.combine_bboxes import (
 )
 
 # TODO put this into config
-pattern = (
-    r"\A(●|•|◘|○|◙|⦿|‣|⁃|⁌|⁍|➡|◆|◇|◌|◈|➢|➣|➤|➥|➦|➧|➱|➮|▷|▶|▸|▹|▻|⊛|=>|->|>|\*|o|\-)\s"
-)
+pattern = r"\A(●|•|◘|○|◙|⦿|‣|⁃|⁌|⁍|➡|◆|◇|◌|◈|➢|➣|➤|➥|➦|➧|➱|➮|▷|▶|▸|▹|▻|⊛|=>|->|>|\*|o|\-)\s"
 pattern = re.compile(pattern)
 
 
 def bbox_after_header_separation(block: _Blocks):
     if len(block.lines) == 1:
-        block_bbox_list = [
-            np.array(span.bbox) for span in block.lines[0].spans if span.text.strip()
-        ]
+        block_bbox_list = [np.array(span.bbox) for span in block.lines[0].spans if span.text.strip()]
         return combine_span_bboxes(block_bbox_list)
     else:
-        first_line_bbox_list = [
-            np.array(span.bbox) for span in block.lines[0].spans if span.text.strip()
-        ]
+        first_line_bbox_list = [np.array(span.bbox) for span in block.lines[0].spans if span.text.strip()]
         # print(first_line_bbox_list)
         first_line_bbox = combine_span_bboxes(first_line_bbox_list)
-        lines_bbox_list = [first_line_bbox] + [
-            np.array(line.bbox) for line in block.lines[1:]
-        ]
+        lines_bbox_list = [first_line_bbox] + [np.array(line.bbox) for line in block.lines[1:]]
         return combine_line_bboxes(lines_bbox_list)
 
 
@@ -67,15 +59,11 @@ class SeperateListIdentifier:
                 if first_span is None:
                     continue
 
-                if result := re.search(
-                    pattern, " ".join(span.text for span in first_span)
-                ):
+                if result := re.search(pattern, " ".join(span.text for span in first_span)):
                     match = result.group().strip()
                     self.proposal[match].append(block)
                     self.proposal_bbox[match].append(np.array(first_span[0].bbox))
-                    self.proposal_font[match].append(
-                        (first_span[0].font, np.round(first_span[0].size, 1))
-                    )
+                    self.proposal_font[match].append((first_span[0].font, np.round(first_span[0].size, 1)))
 
     def critise(self):
         for key, block_list in self.proposal.items():
@@ -89,9 +77,7 @@ class SeperateListIdentifier:
                 f"Misaligned candidate list identifers = {[b for i, b in enumerate(block_list) if not alignment[i]]}"
             )
             self.proposal_bbox[key] = np.array(self.proposal_bbox[key])[alignment]
-            self.proposal_font[key] = [
-                f for i, f in enumerate(self.proposal_font[key]) if alignment[i]
-            ]
+            self.proposal_font[key] = [f for i, f in enumerate(self.proposal_font[key]) if alignment[i]]
 
     def apply(self):
         self.propose()
@@ -109,10 +95,7 @@ class SeperateListIdentifier:
                     bbox=bbox_list[i],
                     tag=self.font_description[font_list[i][0]] + (font_list[i][1],),
                 )
-                if (
-                    block.lines[0].spans[0].text.strip() == key
-                    and len(block.lines[0].spans) > 1
-                ):
+                if block.lines[0].spans[0].text.strip() == key and len(block.lines[0].spans) > 1:
                     block.lines[0].spans.pop(0)
                     block.bbox = tuple(bbox_after_header_separation(block))
 

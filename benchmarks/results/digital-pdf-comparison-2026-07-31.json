@@ -1,0 +1,175 @@
+{
+  "result_label": "DIAGNOSTIC_NOT_COMPARABLE",
+  "generated_on": "2026-07-31",
+  "scope": "Corrected source-only native-text diagnostic slice of retained ParseBench results",
+  "correction": {
+    "prior_claim_retracted": "The four headline metrics were not measured over 361 common PDFs.",
+    "reason": "ParseBench emits metrics only for examples with relevant rules, and shared text-content/text-formatting test IDs retain one evaluator result.",
+    "manual_validation": "All 15 content-metric PDFs were audited candidate-blind against source evidence, then compared with retained candidate outputs and evaluator rules.",
+    "conclusion": "The aggregates are small diagnostics, not exact percentages of visible PDF recovery or a representative corpus-wide ranking."
+  },
+  "method": {
+    "dataset_revision": "2805a1d940f95a203e0ae4b88be9934f7765b3fc",
+    "dataset_jsonl_sha256": "4139192f2507c61f02d3169de750bea56af80c921cb78609f19f42cc931f98a4",
+    "evaluator_revision": "1d460294b3b9c57fb3fa944dc17a9c044c24d1e5",
+    "classifier_sha256": "42062b8e987796f1a3225e3f1b853a3d425f81ba140b4c508f070f8c189b87c3",
+    "scorer_sha256": "8d02b7289f74b9306c43f195dcda71303c7a031b2db84a8f303b06e6b720d016",
+    "reference_independent_selection": true,
+    "selection": {
+      "input_must_be_pdf": true,
+      "excluded_task_tags": ["handwritting", "ocr"],
+      "ocr_layer_signals": ["GlyphLessFont", "at least 90 percent invisible extracted text plus at least 90 percent raster coverage on the same page"],
+      "reject_zero_native_text_document": true,
+      "min_native_characters_per_page_for_scan_rule": 20,
+      "scanned_image_coverage": 0.9,
+      "scanned_page_ratio": 0.5
+    },
+    "aggregation": "Pinned ParseBench EvaluationRunner._aggregate_metrics over filtered retained EvaluationResult objects; metric_emitting_examples separately counts successful examples that emitted each metric.",
+    "limitations": [
+      "Category memberships are not metric denominators.",
+      "The source-only classifier cannot prove that every custom font has a usable Unicode mapping.",
+      "Candidate inference resource envelopes differed and the original pdf2md run used a mutable working tree.",
+      "Public cases are evaluation-only and must not be used to tune parser rules."
+    ]
+  },
+  "slice": {
+    "total_test_ids": 2078,
+    "selected_test_ids": 1848,
+    "excluded_test_ids": 230,
+    "exclusions": {
+      "excluded_task_tag": 132,
+      "non_pdf_input": 42,
+      "scanned_raster_majority": 24,
+      "ocr_text_layer": 21,
+      "no_native_text": 11
+    },
+    "selected_category_memberships": {
+      "chart": 563,
+      "layout": 446,
+      "table": 497,
+      "text_content": 342,
+      "text_formatting": 327
+    },
+    "overlapping_text_content_and_formatting_test_ids": 327
+  },
+  "corrected_text_metrics": {
+    "category_memberships": 342,
+    "all_candidates_successful_for_selected_memberships": true,
+    "metrics": {
+      "content_faithfulness": {
+        "emitting_examples": 15,
+        "scores": {
+          "pdf2md_local": 0.7884947660,
+          "pymupdf_text": 0.8728642404,
+          "pypdf_baseline": 0.7912806853
+        }
+      },
+      "reading_order": {
+        "emitting_examples": 10,
+        "scores": {
+          "pdf2md_local": 0.6086890800,
+          "pymupdf_text": 0.7672564103,
+          "pypdf_baseline": 0.6589230769
+        }
+      },
+      "text_correctness": {
+        "emitting_examples": 15,
+        "scores": {
+          "pdf2md_local": 0.8284856392,
+          "pymupdf_text": 0.8994163628,
+          "pypdf_baseline": 0.8201247958
+        }
+      },
+      "semantic_formatting": {
+        "emitting_examples": 318,
+        "scores": {
+          "pdf2md_local": 0.0095540233,
+          "pymupdf_text": 0.0104411516,
+          "pypdf_baseline": 0.0099170425
+        }
+      }
+    },
+    "sensitivity": {
+      "pypdf_returns_missing_output_recorded_as_successful_zero": true,
+      "pypdf_content_faithfulness_without_that_zero": 0.8478007343
+    }
+  },
+  "manual_audit": {
+    "content_metric_documents": 15,
+    "outright_top_rank_conflicts": [
+      "text_misc__dash",
+      "text_misc__notATable",
+      "text_sparse__ikea"
+    ],
+    "pdf2md_foreign_content_contamination": [
+      "text_dense__tableofcontent",
+      "text_misc__notATable",
+      "text_multicolumns__gridofnumbers"
+    ],
+    "evaluator_anomalies": [
+      "order rules normalize pipes, underscores, and dash runs inconsistently",
+      "line, list, grid, record, and paragraph structure is often unmeasured",
+      "Thai and Turkish tokenization creates false missing rules",
+      "line-wrap-sensitive anchors penalize byte-exact native extraction",
+      "image-description digits contaminate IKEA text correctness",
+      "grid-of-images scores cover captions but not the 50 photographs",
+      "image-only legalRef banner text is expected from native-text candidates",
+      "pypdf returns has no retained output but is marked successful"
+    ],
+    "conclusion": "PyMuPDF is directionally strongest on the audited set, but exact aggregate magnitudes and several per-document rankings are not trustworthy."
+  },
+  "pdf2md_structured_diagnostics": {
+    "tables": {
+      "category_memberships": 497,
+      "grits_trm_composite": {"emitting_examples": 497, "score": 0.0572428412},
+      "grits_content": {"emitting_examples": 497, "score": 0.0829574907},
+      "table_record_match": {"emitting_examples": 497, "score": 0.0226295765}
+    },
+    "layout": {
+      "category_memberships": 446,
+      "content_faithfulness": {"emitting_examples": 62, "failure_padding": 8, "aggregate_denominator": 70, "score": 0.6620356836},
+      "reading_order": {"emitting_examples": 62, "failure_padding": 8, "aggregate_denominator": 70, "score": 0.6620356836},
+      "map_50_95": {"emitting_examples": 376, "score": 0.1368791273},
+      "localization_pass_rate": {"emitting_examples": 376, "score": 0.4612723225},
+      "classification_pass_rate": {"emitting_examples": 376, "score": 0.3644373256},
+      "attribution_pass_rate": {"emitting_examples": 376, "score": 0.0},
+      "element_rule_pass_rate": {"emitting_examples": 376, "score": 0.0163594923}
+    },
+    "formatting": {
+      "category_memberships": 327,
+      "semantic_formatting": {"emitting_examples": 318, "score": 0.0095540233},
+      "text_styling": {"emitting_examples": 253, "score": 0.0080306167},
+      "title_accuracy": {"emitting_examples": 282, "score": 0.0008865248}
+    },
+    "chart_data_points_outside_target": {
+      "category_memberships": 563,
+      "emitting_examples": 563,
+      "score": 0.0132221094
+    }
+  },
+  "evidence": {
+    "raw_summary": "benchmarks/runs/parsebench-digital-pdf-2026-07-31-v7/summary.json",
+    "raw_summary_sha256": "1b50cd76ce9b0140b5173ee3c2e15e82549d4028240725d63056a9d0114bb2fc",
+    "classifications": "benchmarks/runs/parsebench-digital-pdf-2026-07-31-v7/classifications.jsonl",
+    "classifications_sha256": "2dc31a0e01bacb098827fb541519bc03923d50b0a03e3461f2d4be40b8b80874",
+    "manual_audit_evidence": "benchmarks/evidence/digital-pdf-manual-audit-2026-07-31",
+    "candidate_blind_audits": {
+      "exact-metric-audit-a.md": "c942e531f71cfb1a442da3f4b927f37a006a29311411fbe17096d84cb5b6836a",
+      "exact-metric-audit-b.md": "4e192cbaa89fd5642d828ae6b3f15e639b9f87ed7d74f3db6ca898887a257c0f",
+      "exact-metric-audit-c.md": "a2d53b82a6d4e2eab568fc4ec9d7ea7219838589aa3d881fbd39ca543aa93dd4"
+    },
+    "candidate_verification_reports": {
+      "exact-metric-verification-a.md": "be90d0cf358c78cff4e037dc433302345eaa581ed914e8a94bb0f3c17a027b75",
+      "exact-metric-verification-b.md": "114828a7d334b508a19a74605c06160b301bde0020ecda079e0c8e3ec12cb06f",
+      "exact-metric-verification-c.md": "3f8cad2cb980e5d8808ba192d0ea82f3e2da149e2a3beb55d6536d7c73ebe7d9",
+      "digital-comparison-b.md": "b92e7d561d0fa695bd16f8d47673159fbc20b03e950feff0a47abb4292899968"
+    },
+    "pdf2md_report": "benchmarks/runs/parsebench-full/pdf2md_local/pdf2md_local/_evaluation_report.json",
+    "pymupdf_report": "benchmarks/runs/parsebench-full/pymupdf_text/pymupdf_text/_evaluation_report.json",
+    "pypdf_report": "benchmarks/runs/parsebench-full/pypdf_baseline/pypdf_baseline/_evaluation_report.json"
+  },
+  "api_cost_usd": {
+    "anthropic": 0,
+    "gemini": 0
+  }
+}

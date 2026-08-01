@@ -1,0 +1,157 @@
+schema_version: 1
+checkpoint: development_only_no_runs
+status_values:
+  - READY
+  - NOT_READY
+
+# READY means locally invocable under the current repository lock without a new
+# credential, payment, model download, container, GPU, or system dependency.
+# It does not mean benchmarked.
+tools:
+  - id: our_parser
+    name: pdf2md typed PyMuPDF parser
+    status: READY
+    run_evidence: none
+    interface: cli
+    invocation: >-
+      uv run pdf2md extract {input_pdf} {output_markdown}
+      --parquet-path {output_parquet} [--page {one_based_page}]...
+    raw_outputs:
+      - canonical_markdown
+      - document_element_parquet_schema_1_0_0
+    page_selection: repeated_one_based_page_option
+    geometry: upright_display_crop_top_left_points
+    models: none
+    resources: CPU; no OCR; born-digital PDFs with native text
+    license_notes: >-
+      Repository licensing applies; PyMuPDF is offered under AGPL/commercial
+      terms, so the applicable distribution obligations require review.
+    same_harness_eligible: true
+    notes: Availability is not evidence of a completed benchmark run.
+
+  - id: pymupdf_text
+    name: Locked PyMuPDF native-text baseline
+    status: READY
+    run_evidence: none
+    interface: direct_python_api
+    lock_source: uv.lock
+    locked_package: pymupdf==1.28.0
+    invocation_reference: benchmarks/README.md#current-invocations
+    raw_outputs:
+      - page_separated_plain_text
+    missing_fields:
+      - element_types
+      - element_bounding_boxes
+      - page_geometry
+      - structured_reading_order
+      - table_structure
+      - table_cell_geometry
+    page_selection: optional_trailing_one_based_page_arguments
+    geometry: not_emitted
+    models: none
+    resources: CPU; native text only; no OCR
+    license_notes: >-
+      PyMuPDF is offered under AGPL/commercial terms; review the applicable
+      obligations before distribution or service deployment.
+    same_harness_eligible: true
+    notes: Availability is not evidence of a completed benchmark run.
+
+  - id: docling
+    name: Docling
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      No package/container or model artifacts are pinned in this repository;
+      licenses, downloads, resource envelope, and adapter geometry are unverified.
+    future_pin: package/container plus every model revision or digest
+    model_license_resource_notes: Required before admission; do not download during this checkpoint.
+
+  - id: paddleocr
+    name: PaddleOCR / PP-Structure
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      No pipeline, language model, package/container, or weight digest is selected;
+      model terms, accelerator needs, and pixel-to-point projection are unverified.
+    future_pin: code/container and exact pipeline/model weight digests
+    model_license_resource_notes: Required before admission; GPU and download approval may be needed.
+
+  - id: mineru
+    name: MinerU
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      No reproducible release/container or model bundle is pinned; code/weight
+      terms, remote-code/network behavior, resources, and adapter are unverified.
+    future_pin: release/container digest and all model revisions or digests
+    model_license_resource_notes: Required before admission; no remote code or network use without review.
+
+  - id: marker
+    name: Marker
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      Package and model revisions are not pinned; code/weight terms and RAM/GPU
+      requirements are unverified, and optional paid/credentialed LLM paths are not isolated.
+    future_pin: package and every model revision or digest
+    model_license_resource_notes: Required before admission; hosted or LLM-provider paths stay disabled.
+
+  - id: nougat
+    name: Nougat
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      No maintained compatible package and weight revision is pinned; model
+      license, download size, GPU requirement, and adapter are unverified.
+    future_pin: compatible package and model weight digest
+    model_license_resource_notes: Required before admission.
+
+  - id: olmocr
+    name: olmOCR
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      Code, model, and inference stack are not pinned; model/data terms, GPU
+      resources, network behavior, and adapter are unverified.
+    future_pin: code revision, model revision/digest, and inference-stack lock
+    model_license_resource_notes: Required before admission; hosted inference is prohibited without approval.
+
+  - id: adobe_pdf_extract
+    name: Adobe PDF Extract API
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      Requires external credentials and potentially paid quota and transmits PDFs
+      to a third party; no owner approval, billing cap, retention review, or adapter exists.
+    future_pin: API version and client lock after explicit approval
+    model_license_resource_notes: Hosted model is opaque; provider terms and data handling require review.
+
+  - id: google_document_ai
+    name: Google Cloud Document AI
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      Requires cloud credentials, billing, and third-party PDF transmission; no
+      owner approval, processor/version selection, regional retention review, or adapter exists.
+    future_pin: processor type/version and client lock after explicit approval
+    model_license_resource_notes: Hosted model is opaque; provider terms and data handling require review.
+
+  - id: aws_textract
+    name: Amazon Textract
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      Requires AWS credentials, billing, and third-party PDF transmission; no owner
+      approval, region/retention review, API configuration lock, or adapter exists.
+    future_pin: API/client configuration lock after explicit approval
+    model_license_resource_notes: Hosted model is opaque; provider terms and data handling require review.
+
+  - id: azure_document_intelligence
+    name: Azure AI Document Intelligence
+    status: NOT_READY
+    run_evidence: none
+    exact_skip_reason: >-
+      Requires Azure credentials, billing, and third-party PDF transmission; no
+      owner approval, model/API version selection, region/retention review, or adapter exists.
+    future_pin: model/API version and client lock after explicit approval
+    model_license_resource_notes: Hosted model is opaque; provider terms and data handling require review.

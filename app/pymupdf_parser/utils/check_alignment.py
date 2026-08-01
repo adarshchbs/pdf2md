@@ -1,11 +1,10 @@
 """Copyright (C) 2022 Adarsh Gupta"""
 
 import itertools
-import logging
 from typing import List, Tuple
 
 import numpy as np
-from nptyping import NDArray
+from numpy.typing import NDArray
 
 
 def check_x_alignment(bbox_list: NDArray, font_list: List[Tuple], margin: NDArray):
@@ -33,14 +32,9 @@ def check_x_alignment(bbox_list: NDArray, font_list: List[Tuple], margin: NDArra
         if i != j:
             distance = np.min(
                 [np.abs(bbox_list[i][0] - bbox_list[j][0] - m) for m in margin_distance]
-                + [
-                    np.abs(bbox_list[i][0] - bbox_list[j][0] + m)
-                    for m in margin_distance
-                ]
+                + [np.abs(bbox_list[i][0] - bbox_list[j][0] + m) for m in margin_distance]
             )
-            is_x_align[i, j] = np.exp(
-                -distance / (2 * bbox_list[i][3] - bbox_list[i][1])
-            )
+            is_x_align[i, j] = np.exp(-distance / (2 * bbox_list[i][3] - bbox_list[i][1]))
 
     alignment = is_font_same * is_x_align
     alignment = np.sum(alignment, axis=1)

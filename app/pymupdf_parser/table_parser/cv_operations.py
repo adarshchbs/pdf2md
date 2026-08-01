@@ -5,7 +5,7 @@ from typing import List, Tuple
 
 import cv2
 import numpy as np
-from nptyping import Int, NDArray, Shape
+from numpy.typing import NDArray
 
 
 class LineType(Enum):
@@ -17,44 +17,38 @@ class LineType(Enum):
 class LineParameters:
     line_type: LineType
     constant_cordinates: np.int32
-    variable_cordinates: NDArray[Shape["2"], Int]
-    three_point_representation: NDArray[
-        Shape["[constant_cordinate,variable_cordinate_0,variable_cordinate_1]"], Int
-    ]
-    bbox: NDArray[Shape["[x_0,y_0,x_1,y_2]"], Int]
+    variable_cordinates: NDArray
+    three_point_representation: NDArray
+    bbox: NDArray
 
 
-def line_parameter_from_bbox(line: NDArray[Shape["4"], Int], line_type: LineType):
+def line_parameter_from_bbox(line: NDArray, line_type: LineType):
     if line_type is LineType.vertical:
         constant_cordinates = line[0]
-        variable_cordinates: NDArray[Shape["2"], Int] = np.array([line[1], line[3]])
+        variable_cordinates: NDArray = np.array([line[1], line[3]])
 
     elif line_type is LineType.horizontal:
         constant_cordinates = line[1]
-        variable_cordinates: NDArray[Shape["2"], Int] = np.array([line[0], line[2]])
+        variable_cordinates: NDArray = np.array([line[0], line[2]])
     else:
         raise ValueError("Not correct line shape")
 
     three_point_representation = np.hstack([constant_cordinates, variable_cordinates])
 
     if line_type is LineType.vertical:
-        bbox = np.array(
-            [
-                constant_cordinates,
-                variable_cordinates[0],
-                constant_cordinates + 1,
-                variable_cordinates[1],
-            ]
-        )
+        bbox = np.array([
+            constant_cordinates,
+            variable_cordinates[0],
+            constant_cordinates + 1,
+            variable_cordinates[1],
+        ])
     else:
-        bbox = np.array(
-            [
-                variable_cordinates[0],
-                constant_cordinates,
-                variable_cordinates[1],
-                constant_cordinates + 1,
-            ]
-        )
+        bbox = np.array([
+            variable_cordinates[0],
+            constant_cordinates,
+            variable_cordinates[1],
+            constant_cordinates + 1,
+        ])
 
     return LineParameters(
         deepcopy(line_type),
@@ -65,9 +59,7 @@ def line_parameter_from_bbox(line: NDArray[Shape["4"], Int], line_type: LineType
     )
 
 
-def line_parameter_from_three_point_representation(
-    line: NDArray[Shape["3"], Int], line_type: LineType
-):
+def line_parameter_from_three_point_representation(line: NDArray, line_type: LineType):
     if line_type is LineType.vertical:
         bbox = np.array([line[0], line[1], line[0] + 1, line[2]])
     elif line_type is LineType.horizontal:
@@ -101,37 +93,21 @@ def detect_vertical_n_horizontal_lines(
     """Possible value of "kernel_type" variable are 'vertical' and 'horizontal'"""
     image_1 = cv2.erode(img, kernel, iterations=iterations)
     detected_lines = cv2.dilate(image_1, kernel, iterations=iterations)
-    detected_lines, _ = cv2.findContours(
-        detected_lines, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-    )
+    detected_lines, _ = cv2.findContours(detected_lines, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     detected_lines = [cv2.boundingRect(c) for c in detected_lines]
-    return filter_lines_outside_of_acceptable_range(
-        acceptable_size, kernel_type, detected_lines
-    )
+    return filter_lines_outside_of_acceptable_range(acceptable_size, kernel_type, detected_lines)
 
 
-def filter_lines_outside_of_acceptable_range(
-    acceptable_size, kernel_type, detected_lines
-):
+def filter_lines_outside_of_acceptable_range(acceptable_size, kernel_type, detected_lines):
     detected_lines_ret: List[LineParameters] = []
     for c in detected_lines:
-        if (
-            kernel_type is LineType.vertical
-            and acceptable_size[0] < c[3] < acceptable_size[1]
-        ):
+        if kernel_type is LineType.vertical and acceptable_size[0] < c[3] < acceptable_size[1]:
             detected_lines_ret.append(
-                line_parameter_from_bbox(
-                    np.array([c[0], c[1], c[0], c[1] + c[3]]), kernel_type
-                )
+                line_parameter_from_bbox(np.array([c[0], c[1], c[0], c[1] + c[3]]), kernel_type)
             )
-        if (
-            kernel_type is LineType.horizontal
-            and acceptable_size[0] < c[2] < acceptable_size[1]
-        ):
+        if kernel_type is LineType.horizontal and acceptable_size[0] < c[2] < acceptable_size[1]:
             detected_lines_ret.append(
-                line_parameter_from_bbox(
-                    np.array([c[0], c[1], c[0] + c[2], c[1]]), kernel_type
-                )
+                line_parameter_from_bbox(np.array([c[0], c[1], c[0] + c[2], c[1]]), kernel_type)
             )
     return detected_lines_ret
 
@@ -150,16 +126,10 @@ def draw_lines(
 if __name__ == "__main__":
     line = line_parameter_from_bbox(np.array([10, 20, 10, 30]), LineType.vertical)
     print(line)
-    print(
-        line_parameter_from_three_point_representation(
-            line.three_point_representation, LineType.vertical
-        )
-    )
+    print(line_parameter_from_three_point_representation(line.three_point_representation, LineType.vertical))
 
     line = line_parameter_from_bbox(np.array([10, 20, 30, 20]), LineType.horizontal)
     print(line)
     print(
-        line_parameter_from_three_point_representation(
-            line.three_point_representation, LineType.horizontal
-        )
+        line_parameter_from_three_point_representation(line.three_point_representation, LineType.horizontal)
     )

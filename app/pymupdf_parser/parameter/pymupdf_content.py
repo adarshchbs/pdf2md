@@ -1,5 +1,6 @@
 """Copyright (C) 2022 Adarsh Gupta"""
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import numpy as np
@@ -14,10 +15,10 @@ class _Spans:
     ascender: float
     color: int
     descender: float
-    flags: int # superscript/subscript basically a proxy for emphasis - not reliable
-    font: str # font of the span text
-    size: float # font size
-    text: str # text belonging to the span
+    flags: int  # superscript/subscript basically a proxy for emphasis - not reliable
+    font: str  # font of the span text
+    size: float  # font size
+    text: str  # text belonging to the span
     style: int = 0
 
 
@@ -26,16 +27,16 @@ class _Lines:
     bbox: Tuple[float, float, float, float]
     dir: Tuple
     spans: List[_Spans]
-    wmode: int # which direction the text is written in 
+    wmode: int  # which direction the text is written in
 
 
 @dataclass
-class _Blocks: # a paragraph level object
+class _Blocks:  # a paragraph level object
     bbox: Tuple[float, float, float, float]
     lines: List[_Lines]
     number: int
     type: int
-    header: Header = Header("", np.array([]), ())
+    header: Header = field(default_factory=lambda: Header("", np.array([]), ()))
 
 
 @dataclass

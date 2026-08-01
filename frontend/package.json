@@ -1,0 +1,37 @@
+{
+  "name": "pdf2md-provenance-workbench",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json && biome check . && prettier --check 'src/**/*.svelte'",
+    "format": "biome format --write . && prettier --write 'src/**/*.svelte'",
+    "format:check": "biome format . && prettier --check 'src/**/*.svelte'",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.6",
+    "@sveltejs/vite-plugin-svelte": "^7.2.0",
+    "@tailwindcss/vite": "^4.1.11",
+    "@tanstack/svelte-virtual": "^3.13.35",
+    "@types/node": "^22.15.0",
+    "jsdom": "^26.1.0",
+    "lucide-svelte": "^0.468.0",
+    "paneforge": "^1.0.2",
+    "pdfjs-dist": "^6.2.108",
+    "prettier": "^3.9.6",
+    "prettier-plugin-svelte": "^4.1.1",
+    "svelte": "^5.56.8",
+    "svelte-check": "^4.2.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.12",
+    "marked": "^18.0.7"
+  }
+}

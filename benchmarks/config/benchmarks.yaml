@@ -1,0 +1,193 @@
+schema_version: 1
+checkpoint:
+  status: development_smoke_available
+  public_benchmark_runs_completed: 0
+  contains_committed_results: false
+  statement: Synthetic same-input smoke only; no corpus quality comparison has run.
+
+scope:
+  input_kind: born_digital_pdf_with_usable_native_text
+  excluded:
+    - scanned_or_image_only_pdf
+    - OCR_quality_benchmarking
+  tasks:
+    - id: canonical_document_extraction
+      outputs:
+        - markdown_or_plain_text
+        - ordered_elements_when_available
+    - id: structured_table_extraction
+      outputs:
+        - tables
+        - cell_grid_and_spans_when_available
+        - element_and_cell_geometry_when_available
+
+corpus:
+  manifest: null
+  reference_revision: null
+  status: NOT_CONFIGURED
+  exact_skip_reason: >-
+    No immutable, leakage-reviewed corpus manifest and no approved reference
+    revision are configured in this checkpoint.
+  requirements:
+    immutable_source_sha256: true
+    document_ids_from_source_bytes: true
+    holdout_partition_fixed_before_runs: true
+    selected_pages_ordered_unique_one_based: true
+    labels_hidden_from_tools_and_adapters: true
+
+invocation:
+  working_directory: repository_root
+  environment: uv_lock
+  tool_registry: benchmarks/config/tools.yaml
+  raw_output_root: benchmarks/raw
+  normalized_run_root: benchmarks/runs
+  results_root: benchmarks/results
+  overwrite_existing_run: false
+  rerun_failed_documents_only: false
+  network_default: denied
+  credentials_default: denied
+  paid_services_default: denied
+  model_downloads_default: denied
+  containers_default: denied
+  gpu_default: denied
+
+adapter_contract:
+  inputs:
+    - immutable_input_pdf_path
+    - input_sha256
+    - selected_pages_or_explicit_all_pages
+    - empty_per_document_raw_output_directory
+    - timeout_and_resource_envelope
+    - non_reference_derived_tool_configuration
+  boundary: >-
+    Adapter invokes only the tool's public interface and captures immutable raw
+    outputs and process metadata. Deterministic normalization is separate and
+    may not repair output or use references.
+  normalized_format: canonical_schema_1_0_jsonl_one_record_per_page
+  required_identity_fields:
+    - document_id
+    - tool_id
+    - element_id
+    - order
+  optional_extraction_fields:
+    - element_type
+    - content
+    - format
+    - page_number
+    - page_width
+    - page_height
+    - bbox
+    - table_structure
+    - table_cells
+  missing_field_policy:
+    explicit_list_required: true
+    allowed_reasons:
+      - not_emitted
+      - not_applicable
+      - parse_error
+      - coordinate_frame_unverified
+      - tool_error
+      - timeout
+      - resource_exceeded
+      - policy_blocked
+    synthesize_from_reference: false
+    zero_or_empty_substitution: false
+
+coordinates:
+  unit: PDF_point_1_over_72_inch
+  origin: top_left_of_displayed_upright_crop
+  x_direction: right
+  y_direction: down
+  bbox_order:
+    - x0
+    - y0
+    - x1
+    - y1
+  positive_area_required: true
+  source_page_number_base: 1
+  canonical_page_index_base: 0
+  page_projection:
+    target_frame: upright_display_crop
+    apply_crop_translation_before_rotation: true
+    apply_declared_page_rotation: true
+    supported_rotations_degrees:
+      - 0
+      - 90
+      - 180
+      - 270
+    swap_dimensions_for_quarter_turns: true
+    axis_align_projected_box_envelope: true
+    clip_only_floating_point_overshoot: true
+    ambiguous_frame_action: coordinate_frame_unverified
+    materially_out_of_bounds_action: reject_geometry
+    preserve_native_coordinates_and_transform: true
+
+outcomes:
+  success: Raw output normalized without a blocking error.
+  failed: Tool error, timeout, resource excess, invalid raw output, or unsafe geometry.
+  skipped: A declared policy or readiness gate prevented invocation.
+  include_failed_and_skipped_in_manifest: true
+  exclude_failures_from_denominator: false
+  exact_skip_reason_required: true
+
+same_harness:
+  default: false
+  true_requires_identical:
+    - immutable_source_bytes
+    - document_and_page_selection
+    - adapter_contract_version
+    - coordinate_policy
+    - normalization_version
+    - evaluator_version
+    - reference_revision
+    - timeout_and_resource_policy
+    - captured_run_environment
+  external_scores:
+    label: contextual_same_harness_false
+    allowed_in_local_ranking: false
+  reported_rows_must_include:
+    - tool_id
+    - status
+    - same_harness
+    - completed_document_count
+    - failed_document_count
+    - skipped_document_count
+    - exact_skip_reasons
+    - tool_and_model_identity
+
+leakage:
+  forbidden_tool_visible_inputs:
+    - benchmark_labels
+    - silver_or_golden_references
+    - expected_markdown
+    - adjudication_material
+    - holdout_membership_derived_hints
+    - reviewer_source_maps
+    - protected_seeds
+    - prior_tool_outputs
+  prompt_or_retrieval_use_of_benchmark_content: forbidden
+  tuning_on_holdout: forbidden
+  network_tool_requires_data_handling_approval: true
+
+admission_requirements:
+  - immutable_code_package_or_container_pin
+  - immutable_model_revision_or_weight_digest_when_applicable
+  - code_and_model_license_review
+  - resource_envelope
+  - adapter_and_projection_tests
+  - credential_payment_network_and_download_approval_when_applicable
+  - leakage_review
+
+metrics:
+  product_metrics_implemented:
+    - numeric_token_recall
+    - table_numeric_cell_exact
+    - span_structure_precision_recall_f1
+    - row_and_column_exact
+    - citation_coverage_by_paragraph_table_cell
+    - success_empty_timeout_invalid_rates
+    - determinism_rate
+  frozen_scoring_status: NOT_CONFIGURED
+  exact_skip_reason: >-
+    Official metrics, slice definitions, and acceptance thresholds must be pinned
+    with the corpus/reference manifest before a scored public benchmark run.

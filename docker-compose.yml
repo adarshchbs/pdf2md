@@ -6,9 +6,12 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     ports:
-      - "8000:8000"
+      - "8010:8010"
+    environment:
+      PDF2MD_PROJECT_ROOT: /src
     volumes:
       - ./app:/src/app
+      - ./data:/src/data:ro
 
   frontend:
     build:

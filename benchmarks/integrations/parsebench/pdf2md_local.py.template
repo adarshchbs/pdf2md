@@ -1,0 +1,74 @@
+"""Local pdf2md provider copied into the pinned ParseBench checkout."""
+
+from datetime import datetime
+from pathlib import Path
+
+from parse_bench.inference.providers.base import Provider, ProviderPermanentError
+from parse_bench.inference.providers.registry import register_provider
+from parse_bench.schemas.parse_output import PageIR, ParseLayoutPageIR, ParseOutput
+from parse_bench.schemas.pipeline import PipelineSpec
+from parse_bench.schemas.pipeline_io import InferenceRequest, InferenceResult, RawInferenceResult
+from parse_bench.schemas.product import ProductType
+
+from app.pdf2md.engine import extract_document_with_catalog
+from benchmarks.adapters.parsebench import (
+    parsebench_page_geometries,
+    project_parsebench_layout_pages,
+)
+
+
+@register_provider("pdf2md_local")
+class Pdf2mdLocalProvider(Provider):
+    """Run the repository's typed PyMuPDF parser without reference access."""
+
+    def run_inference(self, pipeline: PipelineSpec, request: InferenceRequest) -> RawInferenceResult:
+        if request.product_type != ProductType.PARSE:
+            raise ProviderPermanentError("pdf2md_local only supports PARSE")
+        pdf_path = Path(request.source_file_path)
+        if pdf_path.suffix.lower() != ".pdf" or not pdf_path.is_file():
+            raise ProviderPermanentError(f"PDF file not found: {pdf_path}")
+
+        started_at = datetime.now()
+        extracted = extract_document_with_catalog(pdf_path, annotator="parsebench-pdf2md-local")
+        page_sizes = parsebench_page_geometries(pdf_path)
+        pages = project_parsebench_layout_pages(
+            extracted.elements,
+            extracted.source_catalog,
+            page_sizes,
+        )
+        completed_at = datetime.now()
+        return RawInferenceResult(
+            request=request,
+            pipeline=pipeline,
+            pipeline_name=pipeline.pipeline_name,
+            product_type=request.product_type,
+            raw_output={
+                "pages": pages,
+                "source_catalog": extracted.source_catalog.model_dump(mode="json"),
+                "elements": [element.model_dump(mode="json") for element in extracted.elements],
+            },
+            started_at=started_at,
+            completed_at=completed_at,
+            latency_in_ms=int((completed_at - started_at).total_seconds() * 1000),
+        )
+
+    def normalize(self, raw_result: RawInferenceResult) -> InferenceResult:
+        raw_pages = raw_result.raw_output["pages"]
+        pages = [PageIR(page_index=index, markdown=str(page["md"])) for index, page in enumerate(raw_pages)]
+        output = ParseOutput(
+            example_id=raw_result.request.example_id,
+            pipeline_name=raw_result.pipeline_name,
+            pages=pages,
+            layout_pages=[ParseLayoutPageIR.model_validate(page) for page in raw_pages],
+            markdown="\n\n".join(page.markdown for page in pages if page.markdown),
+        )
+        return InferenceResult(
+            request=raw_result.request,
+            pipeline_name=raw_result.pipeline_name,
+            product_type=raw_result.product_type,
+            raw_output=raw_result.raw_output,
+            output=output,
+            started_at=raw_result.started_at,
+            completed_at=raw_result.completed_at,
+            latency_in_ms=raw_result.latency_in_ms,
+        )

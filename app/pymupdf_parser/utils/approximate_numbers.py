@@ -1,7 +1,8 @@
-from app.pymupdf_parser.utils.cluster import moving_avg_cluster_1d
 import numpy as np
-import pandas as pd
+import polars as pl
 from sortedcollections import SortedDict
+
+from app.pymupdf_parser.utils.cluster import moving_avg_cluster_1d
 from app.typing import Number
 
 
@@ -18,10 +19,12 @@ class ApproximateNumbersWithThreshold:
         """
         self.threshold = threshold
         self.index = moving_avg_cluster_1d(array, threshold)
-        df = pd.DataFrame({"array": array, "index": self.index})
-        index_to_mean_dict = df.groupby("index").aggregate(np.mean).to_dict()["array"]
+        df = pl.DataFrame({"array": array, "index": self.index})
+        index_to_mean_dict = dict(
+            df.group_by("index", maintain_order=True).agg(pl.col("array").mean()).iter_rows()
+        )
         self.value_to_approximation_dict = SortedDict()
-        for value, ind in zip(array, self.index):
+        for value, ind in zip(array, self.index, strict=True):
             self.value_to_approximation_dict[value] = index_to_mean_dict[ind]
 
     def approx(self, value: Number, raise_error=True) -> Number:
@@ -40,9 +43,7 @@ class ApproximateNumbersWithThreshold:
         lower_index = self.value_to_approximation_dict.bisect_left(value)
         if lower_index == -1:
             lower_index += 1
-        just_lower_value_in_dict: Number = self.value_to_approximation_dict.iloc[
-            lower_index
-        ]
+        just_lower_value_in_dict: Number = self.value_to_approximation_dict.iloc[lower_index]
         if np.abs(just_lower_value_in_dict - value) < self.threshold:
             return just_lower_value_in_dict
         upper_index = self.value_to_approximation_dict.bisect_right(value)
